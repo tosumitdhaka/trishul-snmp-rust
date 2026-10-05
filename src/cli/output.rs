@@ -1,0 +1,1 @@
+//! Text/JSON renderers (← cli/output.py)

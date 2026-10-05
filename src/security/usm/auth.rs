@@ -1,0 +1,1 @@
+//! Truncated HMAC stamp/verify (← usm.py auth path)

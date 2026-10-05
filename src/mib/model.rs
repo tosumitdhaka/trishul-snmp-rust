@@ -1,0 +1,1 @@
+//! Serde types for schema 1.1 (← mib/models.py + registry.py:305–587)

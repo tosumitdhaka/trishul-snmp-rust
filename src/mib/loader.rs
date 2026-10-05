@@ -1,0 +1,1 @@
+//! load_bundle, sidecars (← mib/loader.py)

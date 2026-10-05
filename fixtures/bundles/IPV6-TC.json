@@ -1,0 +1,92 @@
+{
+  "module": "IPV6-TC",
+  "language": "SMIv2",
+  "schema_version": "1.1",
+  "producer_version": "0.4.6",
+  "generated_by": "trishul-smi",
+  "generated_at": "2026-08-05T09:26:22Z",
+  "imports": {
+    "SNMPv2-SMI": [
+      "Integer32"
+    ],
+    "SNMPv2-TC": [
+      "TEXTUAL-CONVENTION"
+    ]
+  },
+  "objects": {},
+  "types": {
+    "Ipv6Address": {
+      "class": "textualconvention",
+      "base_type": "OCTET STRING",
+      "constraints": {
+        "kind": "size",
+        "data": [
+          [16, 16]
+        ]
+      },
+      "display_hint": "2x:",
+      "status": "current",
+      "description": "This data type is used to model IPv6 addresses. This is a binary string of 16 octets in network byte-order."
+    },
+    "Ipv6AddressPrefix": {
+      "class": "textualconvention",
+      "base_type": "OCTET STRING",
+      "constraints": {
+        "kind": "size",
+        "data": [
+          [0, 16]
+        ]
+      },
+      "display_hint": "2x:",
+      "status": "current",
+      "description": "This data type is used to model IPv6 address prefixes. This is a binary string of up to 16 octets in network byte-order."
+    },
+    "Ipv6AddressIfIdentifier": {
+      "class": "textualconvention",
+      "base_type": "OCTET STRING",
+      "constraints": {
+        "kind": "size",
+        "data": [
+          [0, 8]
+        ]
+      },
+      "display_hint": "2x:",
+      "status": "current",
+      "description": "This data type is used to model IPv6 address interface identifiers. This is a binary string of up to 8 octets in network byte-order."
+    },
+    "Ipv6IfIndex": {
+      "class": "textualconvention",
+      "base_type": "Integer32",
+      "constraints": {
+        "kind": "range",
+        "data": [
+          [1, 2147483647]
+        ]
+      },
+      "display_hint": "d",
+      "status": "current",
+      "description": "A unique value, greater than zero for each internetwork-layer interface in the managed system. It is recommended that values are assigned contiguously starting from 1. The value for each internetwork-layer interface must remain constant at least from one re-initialization of the entity's network management system to the next re-initialization."
+    },
+    "Ipv6IfIndexOrZero": {
+      "class": "textualconvention",
+      "base_type": "Integer32",
+      "constraints": {
+        "kind": "range",
+        "data": [
+          [0, 2147483647]
+        ]
+      },
+      "display_hint": "d",
+      "status": "current",
+      "description": "This textual convention is an extension of the Ipv6IfIndex convention. The latter defines a greater than zero value used to identify an IPv6 interface in the managed system. This extension permits the additional value of zero. The value zero is object-specific and must therefore be defined as part of the description of any object which uses this syntax. Examples of the usage of zero might include situations where interface was unknown, or when none or all interfaces need to be referenced."
+    }
+  },
+  "notifications": {},
+  "module_metadata": {
+    "lastupdated": null,
+    "revisions": [],
+    "organization": null,
+    "contactinfo": null,
+    "description": null
+  }
+}

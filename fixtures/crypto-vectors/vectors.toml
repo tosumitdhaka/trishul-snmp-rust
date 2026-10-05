@@ -1,0 +1,125 @@
+# SNMPv3 USM crypto ground-truth vectors for the tsnmp-r Rust port.
+#
+# Byte-exact literals transcribed (never re-derived) from the Python
+# reference's crypto-parity test suite.  Two independent ground-truth
+# groups are vendored:
+#
+#   [[netsnmp_aes]]            net-snmp 5.9.4 persistent-store localized
+#                              privacy keys for the Blumenthal
+#                              AES-192/AES-256 key derivation
+#                              (draft-blumenthal-aes-usm-04, net-snmp default).
+#   [[reeder_3des_appendix_b]] draft-reeder-snmpv3-usm-3desede-00
+#                              Appendix B chained password-to-key vectors
+#                              for usm3DESEDEPrivProtocol.
+#
+# Field conventions:
+#   * all byte fields are lowercase hex, no "0x" prefix, even length;
+#   * passphrases are TOML strings (the raw bytes are the UTF-8 encoding
+#     of the string);
+#   * protocol names match the Python `AuthProtocol` / `PrivProtocol`
+#     enum names (MD5, SHA1, SHA224, SHA256, SHA384, SHA512; AES128,
+#     AES192, AES256, THREEDES_EDE).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group 1 — net-snmp 5.9.4 localized privacy keys (Blumenthal AES-192/256)
+#
+# The engineID 0x80001f8804726565646572696e76657374 is net-snmp format-4
+# (0x80001f88 = enterprise 8072 + 04) followed by the ASCII text
+# "reederinvest".  The passphrases are the CI matrix pair.  For each
+# (auth, priv) combination, `expected_localized_priv_key` is the
+# localized privacy key net-snmp 5.9.4 stores in its persistent dir:
+# localize the digest-length Ku against the engineID, then truncate or
+# extend the LOCALIZED key to the cipher key length (24 octets for
+# AES-192, 32 for AES-256).
+#
+# Asserted by `test_net_snmp_aes192_256_priv_key_vectors` — the
+# digest==key-length pair (SHA256/AES-256) is the control case.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[netsnmp_aes]]
+name = "sha256-aes192"
+username = "net-snmp"
+auth_protocol = "SHA256"
+priv_protocol = "AES192"
+engine_id = "80001f8804726565646572696e76657374"
+auth_passphrase = "authpassword12345"
+priv_passphrase = "privpassword12345"
+expected_localized_priv_key = "93cbabe7564aaffcf6561be284c26e9338036d8ff742783b" # 24 octets
+
+[[netsnmp_aes]]
+name = "sha224-aes256"
+username = "net-snmp"
+auth_protocol = "SHA224"
+priv_protocol = "AES256"
+engine_id = "80001f8804726565646572696e76657374"
+auth_passphrase = "authpassword12345"
+priv_passphrase = "privpassword12345"
+expected_localized_priv_key = "c4962c5bb380a5ab0e8f5a545d637ebc068615bae787302983628ae0405bcfdc" # 32 octets
+
+[[netsnmp_aes]]
+name = "sha384-aes192"
+username = "net-snmp"
+auth_protocol = "SHA384"
+priv_protocol = "AES192"
+engine_id = "80001f8804726565646572696e76657374"
+auth_passphrase = "authpassword12345"
+priv_passphrase = "privpassword12345"
+expected_localized_priv_key = "a9ac4757eeaaaae0b12d9355f42542f651f676188abdfa76" # 24 octets
+
+[[netsnmp_aes]]
+name = "sha512-aes256"
+username = "net-snmp"
+auth_protocol = "SHA512"
+priv_protocol = "AES256"
+engine_id = "80001f8804726565646572696e76657374"
+auth_passphrase = "authpassword12345"
+priv_passphrase = "privpassword12345"
+expected_localized_priv_key = "dab9c5469ab8ad695cc36a8f38a8600b6ead36d1c415cf93dff76f31643774af" # 32 octets
+
+[[netsnmp_aes]]
+name = "sha256-aes256-control"
+username = "net-snmp"
+auth_protocol = "SHA256"
+priv_protocol = "AES256"
+engine_id = "80001f8804726565646572696e76657374"
+auth_passphrase = "authpassword12345"
+priv_passphrase = "privpassword12345"
+# control case: SHA-256 digest length == AES-256 key length, so the
+# localized key IS the full cipher key with no truncation/extension.
+expected_localized_priv_key = "93cbabe7564aaffcf6561be284c26e9338036d8ff742783b48366937ea608a93" # 32 octets
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group 2 — draft-reeder-snmpv3-usm-3desede-00 Appendix B
+#
+# The chained password-to-key algorithm for usm3DESEDEPrivProtocol over
+# the password "maplesyrup" and engineID 000000000000000000000002.
+# The chain is K1 | K2: K1 is the ordinary RFC 3414 localized key, K2
+# treats K1 as a new passphrase (hash to a Ku, then localize again).
+# The MD5 chain produces exactly 32 octets; the SHA-1 chain produces 40
+# octets, of which only the first 32 are used as the 3DES key material
+# (first 24 octets = 3DES-EDE key, last 8 of the used 32 = pre-IV).
+#
+# `chain_hex` is the FULL literal printed in the draft's Appendix B
+# (32 octets for MD5, 40 for SHA-1); the 3DES-EDE key material is
+# `chain_hex` truncated to `key_material_octets`.
+#
+# Asserted by `test_3des_short_digest_chain_matches_draft_appendix_b`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[reeder_3des_appendix_b]]
+name = "md5"
+username = "3des"
+auth_protocol = "MD5"
+engine_id = "000000000000000000000002"
+priv_passphrase = "maplesyrup"
+chain_hex = "526f5eed9fcce26f8964c2930787d82b79eff44a90650ee0a3a40abfac5acc12" # 32 octets
+key_material_octets = 32
+
+[[reeder_3des_appendix_b]]
+name = "sha1"
+username = "3des"
+auth_protocol = "SHA1"
+engine_id = "000000000000000000000002"
+priv_passphrase = "maplesyrup"
+chain_hex = "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78936ba6e7d19dfd9cd2d5065547743fb5" # full 40-octet draft string
+key_material_octets = 32 # first 32 octets of chain_hex are the 3DES-EDE key material

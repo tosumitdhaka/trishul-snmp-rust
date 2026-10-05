@@ -1,0 +1,1 @@
+//! SecurityModel enum (← model.py)

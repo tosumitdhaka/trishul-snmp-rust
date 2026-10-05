@@ -1,0 +1,1 @@
+//! V1 GETBULK→GETNEXT downgrade (← client.py:229–308)

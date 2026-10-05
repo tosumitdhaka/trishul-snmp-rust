@@ -1,0 +1,1 @@
+//! NotificationEvent + Serialize (← notify/events.py)

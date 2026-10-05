@@ -1,0 +1,1 @@
+//! Peer/local engine state, recovery flag (← usm.py engine state)

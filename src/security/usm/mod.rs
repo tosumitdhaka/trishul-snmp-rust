@@ -1,0 +1,1 @@
+//! UsmModel facade: wrap/unwrap/prepare (← usm.py)

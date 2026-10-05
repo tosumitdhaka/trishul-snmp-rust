@@ -1,0 +1,1 @@
+//! Notifier (v1/v2c/v3 trap/inform) (← notify/client.py)

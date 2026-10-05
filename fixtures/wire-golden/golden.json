@@ -1,0 +1,149 @@
+{
+  "meta": {
+    "trishul_snmp_version": "0.6.2",
+    "cryptography_version": "48.0.0",
+    "python_version": "3.12.3"
+  },
+  "cases": [
+    {
+      "name": "value-integer",
+      "description": "v2c RESPONSE carrying one INTEGER 42 varbind",
+      "hex": "302902010104067075626c6963a21c020207d10201000201003010300e06092b06010401868d1f0102012a"
+    },
+    {
+      "name": "value-octet-string",
+      "description": "v2c RESPONSE carrying one OCTET STRING \"hello\" varbind",
+      "hex": "302d02010104067075626c6963a220020207d20201000201003014301206092b06010401868d1f02040568656c6c6f"
+    },
+    {
+      "name": "value-null",
+      "description": "v2c RESPONSE carrying one NULL varbind",
+      "hex": "302802010104067075626c6963a21b020207d3020100020100300f300d06092b06010401868d1f030500"
+    },
+    {
+      "name": "value-object-identifier",
+      "description": "v2c RESPONSE carrying one OBJECT IDENTIFIER 1.3.6.1.4.1.4242 varbind",
+      "hex": "302f02010104067075626c6963a222020207d40201000201003016301406092b06010401868d1f0406072b06010401a112"
+    },
+    {
+      "name": "value-ip-address",
+      "description": "v2c RESPONSE carrying one IpAddress 192.0.2.1 varbind",
+      "hex": "302c02010104067075626c6963a21f020207d50201000201003013301106092b06010401868d1f054004c0000201"
+    },
+    {
+      "name": "value-counter32",
+      "description": "v2c RESPONSE carrying one Counter32 4294967295 (2**32-1) varbind",
+      "hex": "302d02010104067075626c6963a220020207d60201000201003014301206092b06010401868d1f06410500ffffffff"
+    },
+    {
+      "name": "value-gauge32",
+      "description": "v2c RESPONSE carrying one Gauge32 12345 varbind",
+      "hex": "302a02010104067075626c6963a21d020207d70201000201003011300f06092b06010401868d1f0742023039"
+    },
+    {
+      "name": "value-timeticks",
+      "description": "v2c RESPONSE carrying one TimeTicks 123456 varbind",
+      "hex": "302b02010104067075626c6963a21e020207d80201000201003012301006092b06010401868d1f08430301e240"
+    },
+    {
+      "name": "value-opaque",
+      "description": "v2c RESPONSE carrying one Opaque 00ff10 varbind",
+      "hex": "302b02010104067075626c6963a21e020207d90201000201003012301006092b06010401868d1f09440300ff10"
+    },
+    {
+      "name": "value-counter64",
+      "description": "v2c RESPONSE carrying one Counter64 2**40 varbind",
+      "hex": "302e02010104067075626c6963a221020207da0201000201003015301306092b06010401868d1f0a4606010000000000"
+    },
+    {
+      "name": "value-no-such-object",
+      "description": "v2c RESPONSE carrying one noSuchObject varbind",
+      "hex": "302802010104067075626c6963a21b020207db020100020100300f300d06092b06010401868d1f0b8000"
+    },
+    {
+      "name": "value-no-such-instance",
+      "description": "v2c RESPONSE carrying one noSuchInstance varbind",
+      "hex": "302802010104067075626c6963a21b020207dc020100020100300f300d06092b06010401868d1f0c8100"
+    },
+    {
+      "name": "value-end-of-mib-view",
+      "description": "v2c RESPONSE carrying one endOfMibView varbind",
+      "hex": "302802010104067075626c6963a21b020207dd020100020100300f300d06092b06010401868d1f0d8200"
+    },
+    {
+      "name": "value-all-types",
+      "description": "v2c RESPONSE carrying all 13 SnmpValue types, one per varbind",
+      "hex": "3082010202010104067075626c6963a281f4020207de0201000201003081e7300e06092b06010401868d1f0102012a301206092b06010401868d1f02040568656c6c6f300d06092b06010401868d1f030500301406092b06010401868d1f0406072b06010401a112301106092b06010401868d1f054004c0000201301206092b06010401868d1f06410500ffffffff300f06092b06010401868d1f0742023039301006092b06010401868d1f08430301e240301006092b06010401868d1f09440300ff10301306092b06010401868d1f0a4606010000000000300d06092b06010401868d1f0b8000300d06092b06010401868d1f0c8100300d06092b06010401868d1f0d8200"
+    },
+    {
+      "name": "v1-get",
+      "description": "SNMPv1 GET request, two NULL varbinds, request-id 1001",
+      "hex": "303502010004067075626c6963a028020203e9020100020100301c300c06082b060102010103000500300c06082b060102010101000500"
+    },
+    {
+      "name": "v1-getnext",
+      "description": "SNMPv1 GETNEXT request, request-id 1002",
+      "hex": "302402010004067075626c6963a117020203ea020100020100300b300906052b060102010500"
+    },
+    {
+      "name": "v1-set",
+      "description": "SNMPv1 SET request, request-id 1003",
+      "hex": "304a02010004067075626c6963a33d020203eb0201000201003031301706082b06010201010600040b73657276657220726f6f6d301606082b06010201010500040a676f6c64656e67617465"
+    },
+    {
+      "name": "v1-response",
+      "description": "SNMPv1 RESPONSE, no error, request-id 1004",
+      "hex": "304702010004067075626c6963a23a020203ec020100020100302e301b06082b06010201010100040f676f6c64656e207631206167656e74300f06082b06010201010300430309fbf1"
+    },
+    {
+      "name": "v1-trap",
+      "description": "SNMPv1 TRAP (RFC 1157 fields: enterprise 1.3.6.1.4.1.8072, agent-addr 127.0.0.1, generic 0 coldStart, specific 0, timestamp 123456), one sysUpTime varbind",
+      "hex": "303a02010004067075626c6963a42d06072b06010401bf0840047f000001020100020100430301e2403011300f06082b06010201010300430301e240"
+    },
+    {
+      "name": "v2c-get",
+      "description": "SNMPv2c GET request, request-id 1101",
+      "hex": "302702010104067075626c6963a01a0202044d020100020100300e300c06082b060102010103000500"
+    },
+    {
+      "name": "v2c-getnext",
+      "description": "SNMPv2c GETNEXT request, request-id 1102",
+      "hex": "302502010104067075626c6963a1180202044e020100020100300c300a06062b06010201020500"
+    },
+    {
+      "name": "v2c-getbulk",
+      "description": "SNMPv2c GETBULK request, non-repeaters 1 (error_status field) and max-repetitions 2 (error_index field), request-id 1103",
+      "hex": "303402010104067075626c6963a5270202044f020101020102301b300c06082b060102010101000500300b06072b0601020102010500"
+    },
+    {
+      "name": "v2c-response-error",
+      "description": "SNMPv2c RESPONSE with error-status 2 (noSuchName) and error-index 1, request-id 1104",
+      "hex": "303402010104067075626c6963a22702020450020102020101301b300c06082b060102010101000500300b06072b0601020163638100"
+    },
+    {
+      "name": "v2c-inform",
+      "description": "SNMPv2c INFORM request (coldStart, sysUpTime + snmpTrapOID varbinds), request-id 1105",
+      "hex": "304102010104067075626c6963a634020204510201000201003028300d06082b0601020101030043012a3017060a2b06010603010104010006092b0601060301010501"
+    },
+    {
+      "name": "v2c-snmpv2-trap",
+      "description": "SNMPv2c SNMPv2-TRAP (coldStart, sysUpTime + snmpTrapOID varbinds), no request-id semantics (id 0)",
+      "hex": "304002010104067075626c6963a7330201000201000201003028300d06082b0601020101030043012a3017060a2b06010603010104010006092b0601060301010501"
+    },
+    {
+      "name": "v2c-report",
+      "description": "SNMPv2c REPORT (PDU tag 0xA8) carrying usmStatsUnknownUserNames.0 Counter32 1, request-id 1106 (assembled with the library BER primitives)",
+      "hex": "302a02010104067075626c6963a81d020204520201000201003011300f060a2b060106030f01010300410101"
+    },
+    {
+      "name": "v3-noauthnopriv-get",
+      "description": "SNMPv3 noAuthNoPriv GET (flags 0x04), user 'golden', engineID 000000000000000000000002, boots 1, time 500, msg-id 1, request-id 1201",
+      "hex": "3066020103300e020101020300ffe304010402010304233021040c000000000000000000000002020101020201f40406676f6c64656e04000400302c040c0000000000000000000000020400a01a020204b1020100020100300e300c06082b060102010103000500"
+    },
+    {
+      "name": "v3-authnopriv-get-md5",
+      "description": "SNMPv3 authNoPriv GET (flags 0x05), HMAC-MD5 with the RFC 3414 A.2 localized key of 'maplesyrup' (16 octets), user 'golden', engineID 000000000000000000000002, boots 1, time 500, msg-id 1, request-id 1202",
+      "hex": "3072020103300e020101020300ffe3040105020103042f302d040c000000000000000000000002020101020201f40406676f6c64656e040ceacd9a5e660821d5847c8d1b0400302c040c0000000000000000000000020400a01a020204b2020100020100300e300c06082b060102010103000500"
+    }
+  ]
+}

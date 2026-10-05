@@ -1,0 +1,1 @@
+//! Oid newtype (← types.py:9, registry.py:77–106)
