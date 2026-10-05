@@ -133,10 +133,17 @@ impl SaltCache {
     /// Records `salt` unless already seen for the same boots/time.
     ///
     /// Returns `true` when the salt is fresh, `false` when the exact
-    /// (engine_boots, engine_time, salt) tuple was seen before (replay).
+    /// (engine_boots, engine_time, salt) tuple was seen before (replay). A
+    /// duplicate still refreshes recency (v3.py:174–175 `move_to_end`) so it
+    /// does not become the next eviction victim.
     fn check_and_record(&mut self, engine_boots: i64, engine_time: i64, salt: &[u8]) -> bool {
         let key = (engine_boots, engine_time, salt.to_vec());
         if self.entries.contains_key(&key) {
+            if let Some(position) = self.order.iter().position(|candidate| *candidate == key)
+                && let Some(recent) = self.order.remove(position)
+            {
+                self.order.push_back(recent);
+            }
             return false;
         }
         self.entries.insert(key.clone(), ());
@@ -462,6 +469,33 @@ mod tests {
         // from a fresh salt.
         assert_eq!(check(&guard, 5, 100, SALT_C), V3ReceiveVerdict::Accept);
         assert_eq!(check(&guard, 5, 100, SALT_A), V3ReceiveVerdict::Accept);
+    }
+
+    #[test]
+    fn duplicate_salt_refreshes_recency() {
+        // A duplicate still counts as a recent touch (v3.py:174–175
+        // move_to_end): after A/B then a duplicate A, inserting C evicts B,
+        // not A.
+        let guard = V3ReplayGuard::with_limits(clock(), 150.0, 2);
+        assert_eq!(check(&guard, 5, 100, SALT_A), V3ReceiveVerdict::Accept);
+        assert_eq!(check(&guard, 5, 100, SALT_B), V3ReceiveVerdict::Accept);
+        // Duplicate A refreshes its recency.
+        assert_eq!(
+            check(&guard, 5, 100, SALT_A),
+            V3ReceiveVerdict::DuplicateSalt
+        );
+        // C evicts the least-recently-used entry: B.
+        assert_eq!(check(&guard, 5, 100, SALT_C), V3ReceiveVerdict::Accept);
+        assert_eq!(
+            check(&guard, 5, 100, SALT_A),
+            V3ReceiveVerdict::DuplicateSalt,
+            "A survived the eviction"
+        );
+        assert_eq!(
+            check(&guard, 5, 100, SALT_B),
+            V3ReceiveVerdict::Accept,
+            "B was evicted"
+        );
     }
 
     #[test]

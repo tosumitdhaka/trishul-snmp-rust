@@ -106,6 +106,7 @@ All fixture directories carry a `SOURCE.md` naming the producing repo + revision
 | 12 | **Dependency MSRV drift above 1.88** (floor currently set by rasn 0.28's let-chains usage — verified E0658 on 1.85, green on 1.88) | CI job builds on the 1.88 toolchain; a bump that raises the floor is rejected or MSRV is consciously bumped as a decision |
 | 13 | **Wire-golden provenance** — fixture bytes depend on the Python crypto version (CFB segment-size history) | Generator pinned to `cryptography` 48.0.0, recorded in `SOURCE.md`; regeneration requires re-verifying against snmpd |
 | 14 | **USM engine-recovery vs timeout race** — Python `_request` catches `RequestTimeoutError` AND `EngineRecoveryReportError` before consulting the recovery flag; the Rust manager catches only `Error::EngineRecovery`, so a REPORT racing a timeout may need the timeout-retry path when USM lands (review ora-5, NIT 11) | Revisit the manager retry branch in Phase 3 when `UsmModel` lands; scripted fake-agent loopback tests for the REPORT-then-timeout ordering |
+| 15 | **Unbounded engine-id map growth in `V3ReplayGuard`** — the per-engine baseline and per-(engine, username) salt-cache maps grow without bound on a noAuthNoPriv listener that hears many distinct engine IDs (replay.rs; inherited from the reference, notify/v3.py:203–204) | Post-1.0 hardening (bounded engine-id LRU or per-engine TTL); upstream parity for now — the reference has the identical unbounded maps |
 
 Deferred (post-1.0): walk streaming API (`impl Stream`), containerized conformance CI,
 criterion benchmarks.

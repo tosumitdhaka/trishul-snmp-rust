@@ -292,13 +292,19 @@ pub fn notification_event_from_v3_envelope(
     envelope: &V3NotificationEnvelope,
     source_address: Option<SocketAddr>,
 ) -> Result<NotificationEvent, ProtocolError> {
+    // Strict UTF-8, matching the reference's `.decode("utf-8")` (events.py:
+    // 190): a non-UTF-8 username raises instead of being lossily replaced.
+    // (Unreachable through the listener/offline paths, since the envelope only
+    // exists for a user whose name already matched the configured UTF-8 user.)
+    let username = String::from_utf8(envelope.view.usm_params.username.clone())
+        .map_err(|_| ProtocolError::new("username is not valid UTF-8"))?;
     notification_event_from_pdu(
         &envelope.pdu,
         envelope.pdu.request_id,
         None,
         source_address,
         Some("3".to_string()),
-        Some(String::from_utf8_lossy(&envelope.view.usm_params.username).into_owned()),
+        Some(username),
         Some(envelope.security_level.clone()),
         Some(envelope.context_engine_id.clone()),
         Some(envelope.context_name.clone()),

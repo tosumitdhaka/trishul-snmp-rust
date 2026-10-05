@@ -9,8 +9,10 @@
 //! The reference's `on_error` per-drop callback is deliberately dropped
 //! (docs/architecture.md §8); `drop_counts()` polling replaces it.
 
+use std::any::Any;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,7 +24,7 @@ use tokio::sync::watch;
 
 use crate::codec::message::{SnmpMessage, decode_message, encode_message};
 use crate::codec::pdu::{Pdu, PduKind};
-use crate::error::{Error, ProtocolError};
+use crate::error::{Error, ProtocolError, TransportError};
 use crate::notify::event::{
     NotificationEvent, notification_event_from_message, notification_event_from_v3_envelope,
 };
@@ -83,6 +85,11 @@ impl Default for ListenerConfig {
 /// `total()` always equals the sum of `get(reason)` over all nine reasons;
 /// the reference's `dropped` vs `drop_counts` reconciliation is a direct
 /// consequence.
+///
+/// These counts cover the *listener's* per-datagram taxonomy (the reference's
+/// `DropReason` set). The [`UdpServer`] maintains a separate, independent
+/// overflow counter (`UdpServer::dropped`) for datagrams the socket queue
+/// dropped before the listener saw them; it is not part of this taxonomy.
 #[derive(Debug, Default)]
 pub struct DropCounts {
     total: AtomicU64,
@@ -391,9 +398,99 @@ impl ListenerHandle {
     }
 }
 
+/// Runs a synchronous per-datagram handler with panic isolation.
+///
+/// A panic inside the handler is converted into `Err(Error::Protocol)` — the
+/// receive-loop equivalent of the reference raising the exception out of
+/// `receive()`. Without this, a panic would kill the receive task and close
+/// the channel, which is indistinguishable from teardown (`recv() → None`).
+fn run_isolated<T>(handler: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    match catch_unwind(AssertUnwindSafe(handler)) {
+        Ok(value) => value,
+        Err(payload) => Err(Error::Protocol(ProtocolError::new(panic_message(payload)))),
+    }
+}
+
+/// Human-readable text for a panic payload (a `&str` or `String` when the
+/// panic carried one, otherwise a generic message).
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("listener internal panic: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("listener internal panic: {message}")
+    } else {
+        "listener internal panic".to_string()
+    }
+}
+
+/// The outcome of processing one v1/v2c datagram.
+enum V2cOutcome {
+    /// An event to surface, with an optional INFORM ack datagram to send first.
+    Event {
+        /// Encoded ack (INFORM_REQUEST only); sent before the event.
+        reply: Option<Vec<u8>>,
+        /// The decoded notification event (boxed to keep the outcome enum
+        /// small).
+        event: Box<NotificationEvent>,
+    },
+    /// The datagram was dropped (already counted).
+    Dropped,
+}
+
+/// The outcome of processing one v3 datagram.
+enum V3Outcome {
+    /// An event to surface, with an optional INFORM ack datagram to send first.
+    Event {
+        /// Encoded ack (INFORM_REQUEST only); sent before the event.
+        reply: Option<Vec<u8>>,
+        /// The decoded notification event (boxed to keep the outcome enum
+        /// small).
+        event: Box<NotificationEvent>,
+    },
+    /// A discovery REPORT to send back; no event.
+    Reply { reply: Vec<u8> },
+    /// The datagram was dropped (already counted).
+    Dropped,
+}
+
+/// Whether a reply-send step finished and how the loop should continue.
+#[derive(Debug, PartialEq, Eq)]
+enum Dispatch {
+    /// The reply was sent; proceed with the event.
+    Continue,
+    /// The reply failed and the `Err` event was sent; skip the event.
+    ErrSent,
+    /// The event channel closed; the loop must break.
+    ChannelClosed,
+}
+
+/// Sends one reply datagram, surfacing a transport failure as an `Err` event
+/// on the channel (the reference raises `TransportError` out of `receive()`;
+/// listener.py:249, 397). `Err` responses are never silently ignored.
+async fn dispatch_reply<F, Fut>(
+    send: F,
+    tx: &mpsc::Sender<Result<NotificationEvent, Error>>,
+) -> Dispatch
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), TransportError>>,
+{
+    match send().await {
+        Ok(()) => Dispatch::Continue,
+        Err(error) => {
+            if tx.send(Err(Error::Transport(error))).await.is_ok() {
+                Dispatch::ErrSent
+            } else {
+                Dispatch::ChannelClosed
+            }
+        }
+    }
+}
+
 /// The v1/v2c receive loop (listener.py:198–249). Every datagram that cannot
-/// surface as an event is counted as a drop; the loop never terminates on a
-/// bad datagram.
+/// surface as an event is counted as a drop; a handler panic or an ack
+/// encode/send failure surfaces as an `Err` event (the reference raises out
+/// of `receive()`); the loop never terminates on a bad datagram.
 async fn v2c_receive_loop(
     server: Arc<UdpServer>,
     communities: Option<Vec<Vec<u8>>>,
@@ -410,28 +507,50 @@ async fn v2c_receive_loop(
             }
             datagram = server.receive() => {
                 let Some(datagram) = datagram else { break; };
-                if let Some(event) = handle_v2c_datagram(
-                    &datagram,
-                    &communities,
-                    &tracker,
-                    &server,
-                ).await
-                    && tx.send(Ok(event)).await.is_err()
-                {
-                    break;
+                let outcome = run_isolated(|| {
+                    handle_v2c_datagram(&datagram, &communities, &tracker)
+                });
+                match outcome {
+                    Ok(V2cOutcome::Event { reply, event }) => {
+                        if let Some(reply) = reply {
+                            match dispatch_reply(
+                                || server.sendto(&reply, datagram.source_address),
+                                &tx,
+                            ).await
+                            {
+                                Dispatch::Continue => {}
+                                Dispatch::ErrSent => continue,
+                                Dispatch::ChannelClosed => break,
+                            }
+                        }
+                        if tx.send(Ok(*event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(V2cOutcome::Dropped) => {}
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-async fn handle_v2c_datagram(
+/// Processes one v1/v2c datagram synchronously (listener.py:198–249).
+///
+/// Decode/community/notification-kind failures are counted drops; an INFORM
+/// ack-encode failure or an event-construction failure surfaces as `Err`
+/// (the reference raises both out of `receive()`), and the loop forwards the
+/// error to the channel.
+fn handle_v2c_datagram(
     datagram: &ReceivedDatagram,
     communities: &Option<Vec<Vec<u8>>>,
     tracker: &DropTracker,
-    server: &UdpServer,
-) -> Option<NotificationEvent> {
-    let message = match decode_message(&datagram.data) {
+) -> Result<V2cOutcome, Error> {
+    let message = match tracked_decode_message(&datagram.data) {
         Ok(message) => message,
         Err(_) => {
             tracker.record(
@@ -439,7 +558,7 @@ async fn handle_v2c_datagram(
                 datagram.source_address,
                 &datagram.data,
             );
-            return None;
+            return Ok(V2cOutcome::Dropped);
         }
     };
     if !community_allowed(communities, &message.community) {
@@ -448,7 +567,7 @@ async fn handle_v2c_datagram(
             datagram.source_address,
             &datagram.data,
         );
-        return None;
+        return Ok(V2cOutcome::Dropped);
     }
     if !matches!(
         message.pdu.kind,
@@ -459,17 +578,24 @@ async fn handle_v2c_datagram(
             datagram.source_address,
             &datagram.data,
         );
-        return None;
+        return Ok(V2cOutcome::Dropped);
     }
-    if message.pdu.kind == PduKind::InformRequest {
-        send_v2c_inform_ack(&message, datagram.source_address, server).await;
-    }
-    notification_event_from_message(&message, Some(datagram.source_address)).ok()
+    let reply = if message.pdu.kind == PduKind::InformRequest {
+        Some(encode_v2c_inform_ack(&message).map_err(Error::Protocol)?)
+    } else {
+        None
+    };
+    let event = notification_event_from_message(&message, Some(datagram.source_address))
+        .map_err(Error::Protocol)?;
+    Ok(V2cOutcome::Event {
+        reply,
+        event: Box::new(event),
+    })
 }
 
-/// Acknowledges an INFORM with a RESPONSE echoing the request id and varbinds
+/// Encodes an INFORM RESPONSE echoing the request id and varbinds
 /// (listener.py:237–249).
-async fn send_v2c_inform_ack(message: &SnmpMessage, addr: SocketAddr, server: &UdpServer) {
+fn encode_v2c_inform_ack(message: &SnmpMessage) -> Result<Vec<u8>, ProtocolError> {
     let response = SnmpMessage {
         version: message.version,
         community: message.community.clone(),
@@ -482,9 +608,7 @@ async fn send_v2c_inform_ack(message: &SnmpMessage, addr: SocketAddr, server: &U
             v1_trap: None,
         },
     };
-    if let Ok(encoded) = encode_message(&response) {
-        let _ = server.sendto(&encoded, addr).await;
-    }
+    encode_message(&response)
 }
 
 /// Immutable v3 listener context shared across datagrams in the receive loop.
@@ -499,9 +623,9 @@ struct V3LoopContext {
 }
 
 /// The v3 receive loop (listener.py:303–397): probe REPORT, auth/priv decode,
-/// replay guard, inform ack. An inform-ack encode failure surfaces as an
-/// `Err` event (the reference raises it out of `receive()`); everything else
-/// is a counted drop.
+/// replay guard, inform ack. An ack/report encode or send failure, or a
+/// handler panic, surfaces as an `Err` event (the reference raises out of
+/// `receive()`); everything else is a counted drop.
 async fn v3_receive_loop(
     server: Arc<UdpServer>,
     ctx: V3LoopContext,
@@ -519,13 +643,37 @@ async fn v3_receive_loop(
                 let Some(datagram) = datagram else { break; };
                 let current_engine_time =
                     current_engine_time(&ctx.local_engine, ctx.anchor, ctx.clock.as_ref());
-                match handle_v3_datagram(&datagram, &ctx, current_engine_time, &server).await {
-                    Ok(Some(event)) => {
-                        if tx.send(Ok(event)).await.is_err() {
+                let outcome = run_isolated(|| {
+                    handle_v3_datagram(&datagram, &ctx, current_engine_time)
+                });
+                match outcome {
+                    Ok(V3Outcome::Event { reply, event }) => {
+                        if let Some(reply) = reply {
+                            match dispatch_reply(
+                                || server.sendto(&reply, datagram.source_address),
+                                &tx,
+                            ).await
+                            {
+                                Dispatch::Continue => {}
+                                Dispatch::ErrSent => continue,
+                                Dispatch::ChannelClosed => break,
+                            }
+                        }
+                        if tx.send(Ok(*event)).await.is_err() {
                             break;
                         }
                     }
-                    Ok(None) => {}
+                    Ok(V3Outcome::Reply { reply }) => {
+                        match dispatch_reply(
+                            || server.sendto(&reply, datagram.source_address),
+                            &tx,
+                        ).await
+                        {
+                            Dispatch::ChannelClosed => break,
+                            Dispatch::Continue | Dispatch::ErrSent => {}
+                        }
+                    }
+                    Ok(V3Outcome::Dropped) => {}
                     Err(error) => {
                         if tx.send(Err(error)).await.is_err() {
                             break;
@@ -537,15 +685,15 @@ async fn v3_receive_loop(
     }
 }
 
-/// Processes one v3 datagram; `Ok(None)` means it was dropped (counted) or
-/// silently skipped (probe REPORT). `Err` surfaces an inform-ack failure.
-async fn handle_v3_datagram(
+/// Processes one v3 datagram synchronously; `Ok(Dropped)` means it was
+/// counted as a drop or silently skipped (probe REPORT). `Err` surfaces an
+/// ack-encode failure or a handler panic via the loop.
+fn handle_v3_datagram(
     datagram: &ReceivedDatagram,
     ctx: &V3LoopContext,
     current_engine_time: u32,
-    server: &UdpServer,
-) -> Result<Option<NotificationEvent>, Error> {
-    let decoded = match V3DecodedDatagram::decode(&datagram.data) {
+) -> Result<V3Outcome, Error> {
+    let decoded = match tracked_decode_v3(&datagram.data) {
         Ok(decoded) => decoded,
         Err(_) => {
             ctx.tracker.record(
@@ -553,25 +701,25 @@ async fn handle_v3_datagram(
                 datagram.source_address,
                 &datagram.data,
             );
-            return Ok(None);
+            return Ok(V3Outcome::Dropped);
         }
     };
     if is_discovery_probe(&decoded) {
         // A REPORT for an empty-engineID probe; encode failure is itself a
-        // drop (listener.py:316–331).
-        match encode_discovery_report(&decoded, &ctx.local_engine, Some(current_engine_time)) {
-            Ok(report) => {
-                let _ = server.sendto(&report, datagram.source_address).await;
-            }
+        // drop (listener.py:316–331). A send failure surfaces as an `Err`
+        // event via the loop's `Reply` dispatch.
+        return match encode_discovery_report(&decoded, &ctx.local_engine, Some(current_engine_time))
+        {
+            Ok(report) => Ok(V3Outcome::Reply { reply: report }),
             Err(_) => {
                 ctx.tracker.record(
                     DropReason::UndecodableBer,
                     datagram.source_address,
                     &datagram.data,
                 );
+                Ok(V3Outcome::Dropped)
             }
-        }
-        return Ok(None);
+        };
     }
 
     let envelope = match decode_v3_notification_message(&decoded, &ctx.user, &ctx.codec) {
@@ -582,7 +730,7 @@ async fn handle_v3_datagram(
                 datagram.source_address,
                 &datagram.data,
             );
-            return Ok(None);
+            return Ok(V3Outcome::Dropped);
         }
         Err(Error::Authentication) => {
             ctx.tracker.record(
@@ -590,7 +738,7 @@ async fn handle_v3_datagram(
                 datagram.source_address,
                 &datagram.data,
             );
-            return Ok(None);
+            return Ok(V3Outcome::Dropped);
         }
         Err(_) => {
             ctx.tracker.record(
@@ -598,7 +746,7 @@ async fn handle_v3_datagram(
                 datagram.source_address,
                 &datagram.data,
             );
-            return Ok(None);
+            return Ok(V3Outcome::Dropped);
         }
     };
 
@@ -616,23 +764,26 @@ async fn handle_v3_datagram(
             datagram.source_address,
             &datagram.data,
         );
-        return Ok(None);
+        return Ok(V3Outcome::Dropped);
     }
 
-    if envelope.pdu.kind == PduKind::InformRequest {
-        let response = encode_inform_response(
+    let reply = if envelope.pdu.kind == PduKind::InformRequest {
+        Some(encode_inform_response(
             &envelope,
             &ctx.user,
             &ctx.local_engine,
             &ctx.codec,
             Some(current_engine_time),
-        )?;
-        let _ = server.sendto(&response, datagram.source_address).await;
-    }
-    Ok(Some(
-        notification_event_from_v3_envelope(&envelope, Some(datagram.source_address))
-            .map_err(Error::Protocol)?,
-    ))
+        )?)
+    } else {
+        None
+    };
+    let event = notification_event_from_v3_envelope(&envelope, Some(datagram.source_address))
+        .map_err(Error::Protocol)?;
+    Ok(V3Outcome::Event {
+        reply,
+        event: Box::new(event),
+    })
 }
 
 /// The listener's monotonic-advanced engine time (listener.py:290–301): the
@@ -655,6 +806,29 @@ fn classify_v2c_drop(data: &[u8]) -> DropReason {
         }
         _ => DropReason::UndecodableBer,
     }
+}
+
+/// Test-only decode counters, scoped to this module so the decode-once
+/// pinning tests are immune to decodes performed by other tests.
+#[cfg(test)]
+static TEST_V2C_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_V3_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Decodes a v1/v2c message, counting the call for the decode-exactly-once
+/// pin (item 4a; the reference's `decode_message` monkeypatch).
+fn tracked_decode_message(data: &[u8]) -> Result<SnmpMessage, ProtocolError> {
+    #[cfg(test)]
+    TEST_V2C_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+    decode_message(data)
+}
+
+/// Decodes a v3 message header, counting the call for the decode-exactly-once
+/// pin (item 4a; the reference's `decode_v3_message` monkeypatch).
+fn tracked_decode_v3(data: &[u8]) -> Result<V3DecodedDatagram, ProtocolError> {
+    #[cfg(test)]
+    TEST_V3_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+    V3DecodedDatagram::decode(data)
 }
 
 /// Decodes just the version INTEGER of a message, without a full decode
@@ -690,6 +864,7 @@ fn community_allowed(communities: &Option<Vec<Vec<u8>>>, community: &[u8]) -> bo
 mod tests {
     use super::*;
     use crate::time::Clock;
+    use crate::types::varbind::VarBind;
     use std::time::Duration;
 
     /// A controllable clock for the rate-limit tests.
@@ -718,6 +893,10 @@ mod tests {
             0
         }
     }
+
+    /// Serializes the tests whose handlers bump the shared decode counters
+    /// (the two `handle_v2c_datagram` tests and the two decode-once pins).
+    static DECODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn drop_counts_reconcile_total_with_per_reason() {
@@ -862,5 +1041,272 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 162);
         assert!(config.communities.is_none());
+    }
+
+    // ── panic isolation + ack-failure surfacing (review items 1, 3) ────────
+
+    #[test]
+    fn run_isolated_surfaces_str_panic_as_protocol_error() {
+        let err = run_isolated(|| -> Result<u32, Error> { panic!("boom") }).unwrap_err();
+        assert!(
+            err.to_string().contains("listener internal panic: boom"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_isolated_surfaces_string_panic_as_protocol_error() {
+        let err =
+            run_isolated(|| -> Result<u32, Error> { std::panic::panic_any(String::from("boom")) })
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("listener internal panic: boom"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_isolated_passes_handler_errors_through() {
+        let err = run_isolated(|| -> Result<u32, Error> {
+            Err(Error::Protocol(ProtocolError::new("handler failure")))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("handler failure"), "{err}");
+    }
+
+    #[test]
+    fn run_isolated_passes_values_through() {
+        assert_eq!(run_isolated(|| Ok(42u32)).unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_reply_send_failure_surfaces_err_event() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let dispatch = dispatch_reply(
+            || async { Err(TransportError::Io("boom".to_string())) },
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            dispatch,
+            Dispatch::ErrSent,
+            "failure is not silently ignored"
+        );
+        let item = rx.recv().await.expect("Err event delivered");
+        assert!(
+            matches!(item, Err(Error::Transport(_))),
+            "expected Err(Transport), got {item:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_reply_send_success_is_silent() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let dispatch = dispatch_reply(|| async { Ok(()) }, &tx).await;
+        assert_eq!(dispatch, Dispatch::Continue);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "a successful reply sends no event"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_v2c_datagram_surfaces_trap_event_without_ack() {
+        let _guard = DECODE_TEST_LOCK.lock().await;
+        let tracker = DropTracker::new(Arc::new(FakeClock::new()));
+        let datagram = ReceivedDatagram {
+            data: v2c_message(b"public", 7, PduKind::SnmpV2Trap),
+            source_address: "127.0.0.1:40000".parse().unwrap(),
+        };
+        match handle_v2c_datagram(&datagram, &None, &tracker).unwrap() {
+            V2cOutcome::Event { reply, event } => {
+                assert!(reply.is_none(), "traps get no ack");
+                assert_eq!(event.request_id, 7);
+            }
+            V2cOutcome::Dropped => panic!("valid trap must not be dropped"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_v2c_datagram_encodes_inform_ack() {
+        let _guard = DECODE_TEST_LOCK.lock().await;
+        let tracker = DropTracker::new(Arc::new(FakeClock::new()));
+        let datagram = ReceivedDatagram {
+            data: v2c_message(b"public", 7, PduKind::InformRequest),
+            source_address: "127.0.0.1:40000".parse().unwrap(),
+        };
+        match handle_v2c_datagram(&datagram, &None, &tracker).unwrap() {
+            V2cOutcome::Event { reply, event } => {
+                let ack = reply.expect("informs get an ack");
+                let decoded = decode_message(&ack).unwrap();
+                assert_eq!(decoded.pdu.kind, PduKind::Response);
+                assert_eq!(decoded.pdu.request_id, event.request_id);
+            }
+            V2cOutcome::Dropped => panic!("valid inform must not be dropped"),
+        }
+    }
+
+    // ── decode-exactly-once pins (review item 4a) ──────────────────────────
+
+    #[tokio::test]
+    async fn listener_decodes_v2c_message_once_per_datagram() {
+        // Port of test_notification_listener_decodes_message_once_per_datagram
+        // (and the v2c half of the decode-count tests): every datagram is
+        // decoded exactly once, even when it fails (the version peek on the
+        // failure path is a TLV walk, not a decode).
+        let _guard = DECODE_TEST_LOCK.lock().await;
+        TEST_V2C_DECODE_COUNT.store(0, Ordering::Relaxed);
+        let listener = NotificationListener::bind(ListenerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            clock: Arc::new(FakeClock::new()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = listener.local_addr();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for datagram in [
+            b"not-snmp".to_vec(),
+            vec![0x30, 0x05, 0x02, 0x01, 0x01],
+            v2c_message(b"public", 9, PduKind::SnmpV2Trap),
+        ] {
+            socket.send_to(&datagram, addr).await.unwrap();
+        }
+        let event = listener
+            .recv()
+            .await
+            .expect("channel open")
+            .expect("no error");
+        assert_eq!(event.request_id, 9);
+        assert_eq!(
+            TEST_V2C_DECODE_COUNT.load(Ordering::Relaxed),
+            3,
+            "three datagrams, three decodes — never more"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_decodes_v3_header_once_per_datagram() {
+        // Port of test_v3_notification_listener_decodes_header_once_per_datagram
+        // and _decode_count_scales_with_datagrams: the header is decoded once
+        // at the listener boundary (probe detection, auth verify, and scoped
+        // decode all reuse the view).
+        let _guard = DECODE_TEST_LOCK.lock().await;
+        TEST_V3_DECODE_COUNT.store(0, Ordering::Relaxed);
+        let user = UsmUser::new(
+            "listener".to_string(),
+            crate::security::usm::kdf::AuthProtocol::None_,
+            crate::security::usm::AuthKey::Passphrase(Vec::new()),
+            crate::security::usm::kdf::PrivProtocol::None_,
+            crate::security::usm::PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap();
+        let peer_engine = UsmLocalEngine {
+            engine_id: [vec![0x80, 0x00, 0x01, 0x02, 0x03], vec![0x41; 12]].concat(),
+            engine_boots: 7,
+            engine_time: 111,
+        };
+        let probe_model = UsmModel::new(
+            user.clone(),
+            Vec::new(),
+            None,
+            Arc::new(SystemClock),
+            Arc::new(SystemRng),
+        );
+        let probe = probe_model.build_discovery_probe().unwrap();
+        let wrong_user = v3_raw_notification(
+            &UsmUser::new(
+                "other".to_string(),
+                crate::security::usm::kdf::AuthProtocol::None_,
+                crate::security::usm::AuthKey::Passphrase(Vec::new()),
+                crate::security::usm::kdf::PrivProtocol::None_,
+                crate::security::usm::PrivKey::Passphrase(Vec::new()),
+            )
+            .unwrap(),
+            1,
+            peer_engine.clone(),
+        );
+        let valid = v3_raw_notification(&user, 2, peer_engine);
+
+        let listener = V3NotificationListener::bind(
+            ListenerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                clock: Arc::new(FakeClock::new()),
+                ..Default::default()
+            },
+            user,
+            UsmLocalEngine {
+                engine_id: [vec![0x80, 0x00, 0x01, 0x02, 0x03], vec![0x42; 12]].concat(),
+                engine_boots: 7,
+                engine_time: 111,
+            },
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for datagram in [probe, wrong_user, b"not-snmp".to_vec(), valid] {
+            socket.send_to(&datagram, addr).await.unwrap();
+        }
+        let event = listener
+            .recv()
+            .await
+            .expect("channel open")
+            .expect("no error");
+        assert_eq!(event.request_id, 2);
+        assert_eq!(
+            TEST_V3_DECODE_COUNT.load(Ordering::Relaxed),
+            4,
+            "four datagrams, four header decodes — never more"
+        );
+    }
+
+    /// Encodes a v2c trap/inform message (test-module fixture).
+    fn v2c_message(community: &[u8], request_id: u32, kind: PduKind) -> Vec<u8> {
+        encode_message(&SnmpMessage {
+            version: crate::codec::message::SnmpVersion::V2c,
+            community: community.to_vec(),
+            pdu: Pdu {
+                kind,
+                request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    crate::types::oid::Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap(),
+                    crate::types::value::SnmpValue::Integer(7),
+                )],
+                v1_trap: None,
+            },
+        })
+        .unwrap()
+    }
+
+    /// Wraps a trap for `user` with `engine` authoritative (test-module
+    /// fixture).
+    fn v3_raw_notification(user: &UsmUser, request_id: u32, engine: UsmLocalEngine) -> Vec<u8> {
+        let model = UsmModel::new(
+            user.clone(),
+            Vec::new(),
+            Some(engine),
+            Arc::new(SystemClock),
+            Arc::new(SystemRng),
+        );
+        model
+            .wrap_pdu(&Pdu {
+                kind: PduKind::SnmpV2Trap,
+                request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    crate::types::oid::Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap(),
+                    crate::types::value::SnmpValue::Integer(7),
+                )],
+                v1_trap: None,
+            })
+            .unwrap()
     }
 }

@@ -568,6 +568,17 @@ impl UsmModel {
         build_discovery_probe(msg_id)
     }
 
+    /// Test-only: the number of passphrase→Ku derivations this model has
+    /// performed (pins cross-datagram KDF reuse; cf. the reference's `_ku`
+    /// monkeypatch counter).
+    #[cfg(test)]
+    pub(crate) fn kdf_calls(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .kdf_calls
+    }
+
     // ── engine discovery ──────────────────────────────────────────────────
 
     /// Performs RFC 3414 engine discovery: sends a noAuthNoPriv probe with an
@@ -717,6 +728,10 @@ impl UsmModel {
                 let ku = match state.ku_cache.get(&(protocol, ku_key.clone())) {
                     Some(ku) => ku.clone(),
                     None => {
+                        #[cfg(test)]
+                        {
+                            state.kdf_calls += 1;
+                        }
                         let ku = password_to_ku(passphrase, protocol);
                         state.ku_cache.insert((protocol, ku_key), ku.clone());
                         ku
@@ -771,6 +786,10 @@ impl UsmModel {
                 let cache_key = KeyMaterial::new(&[&[protocol as u8], engine_id, passphrase]);
                 if let Some(cached) = state.priv_key_cache.get(&cache_key) {
                     return Ok(cached);
+                }
+                #[cfg(test)]
+                {
+                    state.kdf_calls += 1;
                 }
                 let key = privacy::localized_priv_key(
                     passphrase,
@@ -1104,6 +1123,48 @@ mod tests {
         assert_eq!(view.usm_params.engine_id, vec![0xaa; 11]);
         assert_eq!(view.usm_params.engine_boots, 17);
         assert_eq!(view.usm_params.engine_time, 900);
+    }
+
+    #[test]
+    fn passphrase_derivation_runs_once_per_key_material_across_wraps() {
+        // Port of test_v3_notification_listener_reuses_codec_key_caches at
+        // the model level: two wraps for one engine run the RFC 3414 KDF once
+        // per unique derivation (the auth Ku and the priv Ku), not once per
+        // packet. A regression to per-datagram KDF (cache removal, per-call
+        // cache keys) fails this test.
+        let user = UsmUser::new(
+            "listener".to_string(),
+            AuthProtocol::Md5,
+            AuthKey::Passphrase(b"authpassword1".to_vec()),
+            PrivProtocol::Aes128,
+            PrivKey::Passphrase(b"privpassword1".to_vec()),
+        )
+        .unwrap();
+        let local = UsmLocalEngine {
+            engine_id: [vec![0x80, 0x00, 0x01, 0x02, 0x03], vec![0x31; 12]].concat(),
+            engine_boots: 7,
+            engine_time: 111,
+        };
+        let model = UsmModel::new(user, Vec::new(), Some(local), clock(), rng());
+        let trap = Pdu {
+            kind: PduKind::SnmpV2Trap,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap(),
+                SnmpValue::Null,
+            )],
+            v1_trap: None,
+        };
+        for _ in 0..2 {
+            model.wrap_pdu(&trap).unwrap();
+        }
+        assert_eq!(
+            model.kdf_calls(),
+            2,
+            "auth Ku + priv Ku derived exactly once each across two wraps"
+        );
     }
 
     #[test]

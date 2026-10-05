@@ -156,6 +156,10 @@ pub(crate) struct UsmEngineState {
     pub(crate) last_cbc_salt_first_octet: Option<u8>,
     /// Message id counter.
     pub(crate) msg_id_counter: u32,
+    /// Test-only: passphrase→Ku derivation count for this model (the
+    /// reference's `_ku` monkeypatch surface; pins cross-datagram KDF reuse).
+    #[cfg(test)]
+    pub(crate) kdf_calls: u64,
 }
 
 impl UsmEngineState {
