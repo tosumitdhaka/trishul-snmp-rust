@@ -6,6 +6,9 @@
 //! for the agent on `127.0.0.1:1161`, runs the v1+v2c get/getnext/getbulk/walk
 //! matrix over the system subtree, and tears the agent down.
 
+#[path = "../common/mod.rs"]
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -13,7 +16,6 @@ use std::time::Duration;
 use trishul_snmp::codec::message::SnmpVersion;
 use trishul_snmp::codec::pdu::PduKind;
 use trishul_snmp::manager::walk::WalkOptions;
-use trishul_snmp::manager::{Manager, V1Config, V2cConfig};
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::ErrorStatus;
 
@@ -73,14 +75,14 @@ fn spawn_agent() -> Option<(Child, PathBuf)> {
 async fn wait_for_agent(timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        let config = V2cConfig {
-            host: "127.0.0.1".to_string(),
-            port: AGENT_PORT,
-            timeout: Duration::from_millis(200),
-            retries: 0,
-            ..Default::default()
-        };
-        let Ok(manager) = Manager::connect_v2c(config).await else {
+        let Ok(manager) = common::try_connect_v2c_manager_with(
+            AGENT_PORT,
+            "public",
+            Duration::from_millis(200),
+            0,
+        )
+        .await
+        else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
@@ -107,24 +109,8 @@ async fn conformance_v1_v2c_get_getnext_getbulk_walk() {
         panic!("snmpd agent did not become ready on 127.0.0.1:{AGENT_PORT}");
     }
 
-    let v2c = Manager::connect_v2c(V2cConfig {
-        host: "127.0.0.1".to_string(),
-        port: AGENT_PORT,
-        timeout: Duration::from_secs(1),
-        retries: 1,
-        ..Default::default()
-    })
-    .await
-    .expect("connect v2c");
-    let v1 = Manager::connect_v1(V1Config {
-        host: "127.0.0.1".to_string(),
-        port: AGENT_PORT,
-        timeout: Duration::from_secs(1),
-        retries: 1,
-        ..Default::default()
-    })
-    .await
-    .expect("connect v1");
+    let v2c = common::test_v2c_manager_with(AGENT_PORT, "public", Duration::from_secs(1), 1).await;
+    let v1 = common::test_v1_manager_with(AGENT_PORT, "public", Duration::from_secs(1), 1).await;
 
     // v2c GETs over the system subtree.
     let uptime = v2c

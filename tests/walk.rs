@@ -9,14 +9,13 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::agent::{FakeAgent, object_logic, scripted_logic};
 use common::{oid, vb};
 
 use trishul_snmp::error::Error;
 use trishul_snmp::manager::walk::{WalkOptions, walk_subtree};
-use trishul_snmp::manager::{Manager, V1Config, V2cConfig};
+
 use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::ErrorStatus;
@@ -48,25 +47,9 @@ async fn walk_scenario(
     let error_map: HashMap<Oid, (i32, i32)> = errors.into_iter().collect();
     let (agent, port) = FakeAgent::spawn(scripted_logic(script_map, error_map, echo)).await;
     let manager = if v1 {
-        Manager::connect_v1(V1Config {
-            host: "127.0.0.1".to_string(),
-            port,
-            timeout: Duration::from_millis(300),
-            retries: 0,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
+        common::test_v1_manager(port).await
     } else {
-        Manager::connect_v2c(V2cConfig {
-            host: "127.0.0.1".to_string(),
-            port,
-            timeout: Duration::from_millis(300),
-            retries: 0,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
+        common::test_v2c_manager(port).await
     };
     let results = manager
         .walk(
@@ -220,15 +203,7 @@ async fn walk_aborts_on_agent_error_status() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(V2cConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager
         .walk(oid(&ROOT), WalkOptions::default())
         .await
@@ -251,15 +226,7 @@ async fn v1_walk_terminates_cleanly_on_no_such_name() {
     // v1 GETNEXT past the end answers noSuchName: the walk ends cleanly.
     let objects = vec![(oid(&A), SnmpValue::Integer(1))];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(V1Config {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let results = manager
         .walk(oid(&ROOT), WalkOptions::default())
         .await
@@ -279,15 +246,7 @@ async fn v2c_walk_aborts_on_no_such_name() {
     // For v2c, a noSuchName from the agent is an error, not a walk end.
     let objects = vec![(oid(&A), SnmpValue::Integer(1))];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v2c(V2cConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager
         .walk(
             oid(&ROOT),
@@ -315,15 +274,7 @@ async fn v2c_walk_aborts_on_no_such_name() {
 async fn v1_walk_uses_getnext_requests_even_when_bulk_requested() {
     let objects = vec![(oid(&A), SnmpValue::Integer(1))];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(V1Config {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let _ = manager
         .walk(
             oid(&ROOT),
@@ -375,15 +326,7 @@ async fn walk_subtree_error_aborts_with_collected_rows_lost() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(V2cConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager
         .walk(oid(&ROOT), WalkOptions::default())
         .await

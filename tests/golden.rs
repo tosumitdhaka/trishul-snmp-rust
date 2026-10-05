@@ -11,11 +11,12 @@
 
 use std::net::Ipv4Addr;
 
+mod common;
+
 use serde_json::Value;
 
 use trishul_snmp::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
 use trishul_snmp::codec::pdu::{Pdu, PduKind, V1TrapFields};
-use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::VarBind;
 
@@ -30,20 +31,10 @@ const SNMP_TRAP_OID_VALUE: &[u32] = &[1, 3, 6, 1, 6, 3, 1, 1, 5, 1];
 const USM_STATS_UNKNOWN_USERS: &[u32] = &[1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0];
 const VALUE_OID_PREFIX: &[u32] = &[1, 3, 6, 1, 4, 1, 99999];
 
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
-
-fn oid(arcs: &[u32]) -> Oid {
-    Oid::from_arcs(arcs).unwrap()
-}
-
-fn vb(arcs: &[u32], value: SnmpValue) -> VarBind {
-    VarBind::new(oid(arcs), value)
-}
+// `hex`/`oid`/`vb` come from `tests/common` (golden's former `unhex` ≡
+// common's `hex`); the message builders below are golden-specific and stay
+// local.
+use common::{hex, oid, vb};
 
 fn pdu(
     kind: PduKind,
@@ -414,7 +405,7 @@ fn golden_encode_and_decode_parity() {
             skipped += 1;
             continue;
         }
-        let expected = unhex(case["hex"].as_str().unwrap());
+        let expected = hex(case["hex"].as_str().unwrap());
         let message = build(name);
 
         let encoded =

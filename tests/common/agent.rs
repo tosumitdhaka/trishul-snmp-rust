@@ -55,20 +55,22 @@ impl AgentReply {
 
 /// Response logic: given the requested (first-varbind) OID and PDU kind,
 /// produce the reply.
-pub type AgentLogic = Box<dyn Fn(&Oid, PduKind) -> AgentReply + Send + Sync>;
+pub type AgentLogic = Arc<dyn Fn(&Oid, PduKind) -> AgentReply + Send + Sync>;
 
 /// A loopback UDP fake agent.
 ///
 /// Decodes inbound messages, records what was requested, computes a reply via
 /// the injected logic, and echoes back the request's version/community/
-/// request-id. Use [`FakeAgent::stop`] or drop the handle to end it.
+/// request-id. Teardown is automatic: dropping the last [`FakeAgent`] handle
+/// signals the pump task to exit (also on test panics). Use [`FakeAgent::stop`]
+/// for mid-test teardown.
 pub struct FakeAgent {
     socket: Arc<UdpSocket>,
     logic: AgentLogic,
-    requested_oids: Mutex<Vec<Oid>>,
-    requested_kinds: Mutex<Vec<PduKind>>,
-    requested_max_repetitions: Mutex<Vec<i32>>,
-    received: Mutex<Vec<Vec<u8>>>,
+    requested_oids: Arc<Mutex<Vec<Oid>>>,
+    requested_kinds: Arc<Mutex<Vec<PduKind>>>,
+    requested_max_repetitions: Arc<Mutex<Vec<i32>>>,
+    received: Arc<Mutex<Vec<Vec<u8>>>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     port: u16,
 }
@@ -80,17 +82,26 @@ impl FakeAgent {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback"));
         let port = socket.local_addr().expect("bound").port();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let requested_oids = Arc::new(Mutex::new(Vec::new()));
+        let requested_kinds = Arc::new(Mutex::new(Vec::new()));
+        let requested_max_repetitions = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(Mutex::new(Vec::new()));
         let agent = Arc::new(FakeAgent {
             socket: Arc::clone(&socket),
-            logic,
-            requested_oids: Mutex::new(Vec::new()),
-            requested_kinds: Mutex::new(Vec::new()),
-            requested_max_repetitions: Mutex::new(Vec::new()),
-            received: Mutex::new(Vec::new()),
+            logic: Arc::clone(&logic),
+            requested_oids: Arc::clone(&requested_oids),
+            requested_kinds: Arc::clone(&requested_kinds),
+            requested_max_repetitions: Arc::clone(&requested_max_repetitions),
+            received: Arc::clone(&received),
             shutdown: shutdown_tx,
             port,
         });
-        let task_agent = Arc::clone(&agent);
+        let task_socket = Arc::clone(&socket);
+        let task_logic = logic;
+        let task_oids = Arc::clone(&requested_oids);
+        let task_kinds = Arc::clone(&requested_kinds);
+        let task_max_rep = Arc::clone(&requested_max_repetitions);
+        let task_received = Arc::clone(&received);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
@@ -100,13 +111,13 @@ impl FakeAgent {
                             break;
                         }
                     }
-                    recv = task_agent.socket.recv_from(&mut buf) => {
+                    recv = task_socket.recv_from(&mut buf) => {
                         let (n, peer) = match recv {
                             Ok(result) => result,
                             Err(_) => break,
                         };
                         let data = buf[..n].to_vec();
-                        task_agent.record_received(data.clone());
+                        task_received.lock().unwrap().push(data.clone());
                         if let Ok(message) = decode_message(&data) {
                             let requested = message
                                 .pdu
@@ -114,8 +125,10 @@ impl FakeAgent {
                                 .first()
                                 .map(|v| v.oid.clone())
                                 .unwrap_or_else(|| oid(&[0, 0]));
-                            task_agent.record_request(&requested, message.pdu.kind, message.pdu.error_index);
-                            let reply = (task_agent.logic)(&requested, message.pdu.kind);
+                            task_oids.lock().unwrap().push(requested.clone());
+                            task_kinds.lock().unwrap().push(message.pdu.kind);
+                            task_max_rep.lock().unwrap().push(message.pdu.error_index);
+                            let reply = (task_logic)(&requested, message.pdu.kind);
                             // A real agent answers with its own (fixed) community;
                             // only the version and request id are echoed.
                             let response = SnmpMessage {
@@ -131,7 +144,7 @@ impl FakeAgent {
                                 },
                             };
                             if let Ok(bytes) = encode_message(&response) {
-                                let _ = task_agent.socket.send_to(&bytes, peer).await;
+                                let _ = task_socket.send_to(&bytes, peer).await;
                             }
                         }
                     }
@@ -141,17 +154,15 @@ impl FakeAgent {
         (agent, port)
     }
 
-    fn record_received(&self, data: Vec<u8>) {
-        self.received.lock().unwrap().push(data);
-    }
-
-    fn record_request(&self, requested: &Oid, kind: PduKind, max_repetitions: i32) {
-        self.requested_oids.lock().unwrap().push(requested.clone());
-        self.requested_kinds.lock().unwrap().push(kind);
-        self.requested_max_repetitions
-            .lock()
-            .unwrap()
-            .push(max_repetitions);
+    /// Spawns a plain agent that answers every request with an endOfMibView
+    /// response (for tests that only need a listening socket).
+    pub async fn spawn_plain() -> (Arc<FakeAgent>, u16) {
+        Self::spawn(scripted_logic(
+            Default::default(),
+            Default::default(),
+            false,
+        ))
+        .await
     }
 
     /// Stops the agent task.
@@ -196,6 +207,14 @@ impl FakeAgent {
     }
 }
 
+impl Drop for FakeAgent {
+    fn drop(&mut self) {
+        // Signals the pump task to exit so a dropped (or panicked) test handle
+        // cannot leave an agent task running.
+        let _ = self.shutdown.send(true);
+    }
+}
+
 /// Polls until the agent has recorded at least `count` datagrams or the
 /// deadline passes (used after fire-and-forget sends).
 pub async fn wait_for_datagrams(agent: &FakeAgent, count: usize) {
@@ -212,7 +231,7 @@ pub fn scripted_logic(
     error_script: HashMap<Oid, (i32, i32)>,
     echo_requests: bool,
 ) -> AgentLogic {
-    Box::new(move |requested, _kind| {
+    Arc::new(move |requested, _kind| {
         if echo_requests {
             return AgentReply::ok(vec![vb(requested.arcs(), SnmpValue::Null)]);
         }
@@ -233,7 +252,7 @@ pub fn object_logic(mut objects: Vec<(Oid, SnmpValue)>, v1_no_such_name: bool) -
     // A real agent's object table is OID-ordered; the linear successor lookup
     // below relies on it (matching the reference's ordered `_objects`).
     objects.sort_by(|a, b| a.0.cmp(&b.0));
-    Box::new(move |requested, kind| match kind {
+    Arc::new(move |requested, kind| match kind {
         PduKind::GetRequest => match objects.iter().find(|(oid, _)| oid == requested) {
             Some((_, value)) => AgentReply::ok(vec![vb(requested.arcs(), value.clone())]),
             None => {
@@ -264,22 +283,22 @@ pub fn object_logic(mut objects: Vec<(Oid, SnmpValue)>, v1_no_such_name: bool) -
 
 /// An agent that never answers (drops inbound datagrams).
 pub async fn silent_agent() -> (Arc<FakeAgent>, u16) {
-    // A logic that produces a reply is still required by the harness; instead
-    // of a reply we use a dedicated socket that absorbs datagrams.
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback"));
     let port = socket.local_addr().expect("bound").port();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let received = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(FakeAgent {
         socket: Arc::clone(&socket),
-        logic: Box::new(|_, _| AgentReply::default()),
-        requested_oids: Mutex::new(Vec::new()),
-        requested_kinds: Mutex::new(Vec::new()),
-        requested_max_repetitions: Mutex::new(Vec::new()),
-        received: Mutex::new(Vec::new()),
+        logic: Arc::new(|_, _| AgentReply::default()),
+        requested_oids: Arc::new(Mutex::new(Vec::new())),
+        requested_kinds: Arc::new(Mutex::new(Vec::new())),
+        requested_max_repetitions: Arc::new(Mutex::new(Vec::new())),
+        received: Arc::clone(&received),
         shutdown: shutdown_tx,
         port,
     });
-    let task_agent = Arc::clone(&agent);
+    let task_socket = Arc::clone(&socket);
+    let task_received = Arc::clone(&received);
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -289,9 +308,9 @@ pub async fn silent_agent() -> (Arc<FakeAgent>, u16) {
                         break;
                     }
                 }
-                recv = task_agent.socket.recv_from(&mut buf) => {
+                recv = task_socket.recv_from(&mut buf) => {
                     let Ok((n, _peer)) = recv else { break };
-                    task_agent.record_received(buf[..n].to_vec());
+                    task_received.lock().unwrap().push(buf[..n].to_vec());
                 }
             }
         }

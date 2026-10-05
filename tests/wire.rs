@@ -12,6 +12,8 @@
 //! message, because rasn's error text differs from the reference's hand-rolled
 //! wording.
 
+mod common;
+
 use std::net::Ipv4Addr;
 
 use trishul_snmp::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
@@ -26,22 +28,10 @@ use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::{ErrorStatus, VarBind};
 
 // ── helpers ────────────────────────────────────────────────────────────────
+// `hex`/`oid`/`vb` come from `tests/common`; the builders below are
+// wire-specific and stay local.
 
-fn hex(s: &str) -> Vec<u8> {
-    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    (0..compact.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&compact[i..i + 2], 16).unwrap())
-        .collect()
-}
-
-fn oid(arcs: &[u32]) -> Oid {
-    Oid::from_arcs(arcs).unwrap()
-}
-
-fn vb(arcs: &[u32], value: SnmpValue) -> VarBind {
-    VarBind::new(oid(arcs), value)
-}
+use common::{hex, oid, vb};
 
 fn sys_uptime_vb(value: SnmpValue) -> VarBind {
     vb(&[1, 3, 6, 1, 2, 1, 1, 3, 0], value)

@@ -1,8 +1,49 @@
 //! CommunityModel (← community.py)
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
 use crate::codec::pdu::Pdu;
 use crate::error::{Error, ProtocolError, UnwrapOutcome};
+use crate::time::{Rng, SystemRng};
+
+/// Shared community-security client configuration
+/// (← client.py:V1Config/V2cConfig, notify/client.py:V1NotifierConfig/V2cNotifierConfig).
+///
+/// The manager's `V1Config`/`V2cConfig` and the notifier's
+/// `V1NotifierConfig`/`V2cNotifierConfig` are aliases of this type, keeping
+/// the architecture §5.5 names public (§5.5 constructor-shape note). The
+/// shared default port is the manager's 161; trap senders should set `port`
+/// explicitly (SNMP trap default 162).
+#[derive(Clone)]
+pub struct CommunityConfig {
+    /// Remote host.
+    pub host: String,
+    /// Remote UDP port.
+    pub port: u16,
+    /// Community string.
+    pub community: String,
+    /// Per-attempt response timeout (default 2s).
+    pub timeout: Duration,
+    /// Retries after the initial attempt (default 1).
+    pub retries: u32,
+    /// Randomness seam (default SystemRng).
+    pub rng: Arc<dyn Rng>,
+}
+
+impl Default for CommunityConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 161,
+            community: "public".to_string(),
+            timeout: Duration::from_secs(2),
+            retries: 1,
+            rng: Arc::new(SystemRng),
+        }
+    }
+}
 
 /// Community-based security model for v1/v2c (← community.py:CommunityModel).
 ///

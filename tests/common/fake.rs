@@ -42,6 +42,31 @@ impl Clock for FakeClock {
     }
 }
 
+/// A deterministic counter-based RNG (test seam for request-id tests).
+pub struct CounterRng {
+    next: Mutex<u32>,
+}
+
+impl CounterRng {
+    /// Creates a counter starting at `start`; each draw returns the current
+    /// value and increments (wrapping).
+    #[must_use]
+    pub fn new(start: u32) -> Self {
+        Self {
+            next: Mutex::new(start),
+        }
+    }
+}
+
+impl Rng for CounterRng {
+    fn fill_bytes(&self, buf: &mut [u8]) {
+        let mut next = self.next.lock().unwrap();
+        let value = *next;
+        *next = next.wrapping_add(1);
+        buf.copy_from_slice(&value.to_be_bytes());
+    }
+}
+
 /// A deterministic byte source replaying a fixed byte stream (repeats the
 /// final byte once exhausted).
 pub struct FakeRng {

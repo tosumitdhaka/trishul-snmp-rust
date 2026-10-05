@@ -18,10 +18,9 @@ use common::{hex, oid, vb};
 use trishul_snmp::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
 use trishul_snmp::codec::pdu::{Pdu, PduKind};
 use trishul_snmp::error::{Error, TransportError};
-use trishul_snmp::manager::{Manager, V1Config, V2cConfig};
+
 use trishul_snmp::security::SecurityModel;
 use trishul_snmp::security::community::CommunityModel;
-use trishul_snmp::time::Rng;
 use trishul_snmp::transport::dispatcher::RequestDispatcher;
 use trishul_snmp::transport::udp::UdpTransport;
 use trishul_snmp::types::value::SnmpValue;
@@ -167,19 +166,6 @@ fn test_security() -> Arc<SecurityModel> {
     ))
 }
 
-struct DeterministicRng {
-    next: Mutex<u32>,
-}
-
-impl Rng for DeterministicRng {
-    fn fill_bytes(&self, buf: &mut [u8]) {
-        let mut next = self.next.lock().unwrap();
-        let value = *next;
-        *next = next.wrapping_add(1);
-        buf.copy_from_slice(&value.to_be_bytes());
-    }
-}
-
 fn upcast(transport: Arc<FakeTransport>) -> Arc<dyn UdpTransport> {
     transport
 }
@@ -194,9 +180,7 @@ fn dispatcher(
         test_security(),
         timeout,
         retries,
-        Arc::new(DeterministicRng {
-            next: Mutex::new(7),
-        }),
+        common::counter_rng(7),
     )
     .unwrap()
 }
@@ -470,37 +454,13 @@ async fn prepare_request_reserves_and_release_frees() {
 
 // ───────────────────────────── manager operations ─────────────────────────────
 
-fn v2c_manager_config(port: u16, community: &str) -> V2cConfig {
-    V2cConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        community: community.to_string(),
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    }
-}
-
-fn v1_manager_config(port: u16, community: &str) -> V1Config {
-    V1Config {
-        host: "127.0.0.1".to_string(),
-        port,
-        community: community.to_string(),
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    }
-}
-
 const SYS_UPTIME: [u32; 9] = [1, 3, 6, 1, 2, 1, 1, 3, 0];
 
 #[tokio::test]
 async fn v2c_get_roundtrip() {
     let objects = vec![(oid(&SYS_UPTIME), SnmpValue::TimeTicks(12345))];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, false)).await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let response = manager.get(vec!["1.3.6.1.2.1.1.3.0"]).await.unwrap();
     assert_eq!(response.error_status, ErrorStatus::NoError);
     assert_ne!(response.request_id, 0);
@@ -516,9 +476,7 @@ async fn v1_get_roundtrip() {
         SnmpValue::OctetString(b"v1 agent".to_vec()),
     )];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager.get(vec!["1.3.6.1.2.1.1.1.0"]).await.unwrap();
     assert_eq!(response.error_status, ErrorStatus::NoError);
     assert_eq!(
@@ -538,9 +496,7 @@ async fn v2c_get_next_roundtrip() {
         (oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(1)),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, false)).await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let response = manager.get_next(vec!["1.3.6.1.2.1.1.1.0"]).await.unwrap();
     assert_eq!(response.varbinds[0].oid, oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]));
     assert_eq!(response.varbinds[0].value, SnmpValue::TimeTicks(1));
@@ -552,9 +508,7 @@ async fn v2c_get_bulk_sends_max_repetitions_and_returns_rows() {
     // GETBULK from sysUpTime.0 lands on the only table object after it.
     let objects = vec![(oid(&[1, 3, 6, 1, 2, 1, 2, 1, 0]), SnmpValue::Integer(2))];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, false)).await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.1.3.0"], 0, 5)
         .await
@@ -593,9 +547,7 @@ async fn v1_get_bulk_treats_no_such_name_as_end_of_mib_walk() {
         ),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.2.2"], 0, 10)
         .await
@@ -642,9 +594,7 @@ async fn v1_get_bulk_ends_columns_on_no_such_name() {
         ),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.6.0"], 0, 10)
         .await
@@ -683,9 +633,7 @@ async fn v1_get_bulk_non_repeaters() {
         ),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.2.2.1.2.1", "1.3.6.1.2.1.2.2.1.1.1"], 1, 2)
         .await
@@ -727,9 +675,7 @@ async fn v1_get_bulk_interleaves_repeaters_repetition_major() {
         ),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.2.2.1.1.2", "1.3.6.1.2.1.2.2.1.1.1"], 0, 2)
         .await
@@ -764,9 +710,7 @@ async fn v1_get_bulk_error_response_carries_status_and_collected() {
     let errors = std::collections::HashMap::from([(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), (5, 1))]);
     let (agent, port) =
         FakeAgent::spawn(scripted_logic(script.into_iter().collect(), errors, false)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let response = manager
         .get_bulk(vec!["1.3.6.1.2.1.1.3.0"], 0, 5)
         .await
@@ -784,9 +728,7 @@ async fn get_rejects_symbolic_target_without_bundle() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager.get(vec!["IF-MIB::ifDescr.1"]).await.unwrap_err();
     assert!(err.to_string().contains("requires a loaded bundle"));
     agent.stop();
@@ -800,9 +742,7 @@ async fn get_rejects_unrecognized_target() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager.get(vec!["not-an-oid"]).await.unwrap_err();
     assert!(
         err.to_string()
@@ -819,9 +759,7 @@ async fn get_rejects_empty_targets() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let err = manager.get(Vec::<&str>::new()).await.unwrap_err();
     assert!(err.to_string().contains("At least one target is required"));
     agent.stop();
@@ -835,9 +773,7 @@ async fn v2c_manager_wrong_community_times_out() {
         false,
     ))
     .await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "wrong"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager_with(port, "wrong", Duration::from_millis(300), 0).await;
     let err = manager.get(vec!["1.3.6.1.2.1.1.3.0"]).await.unwrap_err();
     assert!(matches!(err, Error::Timeout { attempts: 1 }), "got {err:?}");
     agent.stop();
@@ -853,9 +789,7 @@ async fn manager_walk_uses_getnext_for_v1() {
         (oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(1)),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
-    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v1_manager(port).await;
     let results = manager
         .walk(
             "1.3.6.1.2.1.1",
@@ -883,9 +817,7 @@ async fn bulkwalk_uses_getbulk_with_max_repetitions() {
         (oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(1)),
     ];
     let (agent, port) = FakeAgent::spawn(object_logic(objects, false)).await;
-    let manager = Manager::connect_v2c(v2c_manager_config(port, "public"))
-        .await
-        .unwrap();
+    let manager = common::test_v2c_manager(port).await;
     let results = manager
         .walk(
             "1.3.6.1.2.1.1",

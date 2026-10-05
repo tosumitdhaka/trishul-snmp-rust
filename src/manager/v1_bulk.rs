@@ -31,7 +31,7 @@ pub(crate) async fn v1_get_bulk(
 
     // Non-repeater columns: single GETNEXT each.
     for oid in &oids[..split] {
-        let response = manager.get_next_oid(oid).await?;
+        let response = manager.get_oid(oid, None).await?;
         last_request_id = response.request_id;
         match response.error_status {
             ErrorStatus::NoError => {
@@ -61,7 +61,7 @@ pub(crate) async fn v1_get_bulk(
             let Some(oid) = column.as_ref() else {
                 continue;
             };
-            let response = manager.get_next_oid(oid).await?;
+            let response = manager.get_oid(oid, None).await?;
             last_request_id = response.request_id;
             match response.error_status {
                 ErrorStatus::NoError => {

@@ -2,17 +2,15 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::codec::message::SnmpVersion;
 use crate::codec::pdu::{Pdu, PduKind, V1TrapFields};
 use crate::error::{Error, ProtocolError};
 use crate::manager::response_from_pdu;
 use crate::security::SecurityModel;
-use crate::security::community::CommunityModel;
+use crate::security::community::{CommunityConfig, CommunityModel};
 use crate::session::{SessionConfig, SnmpSession};
 use crate::target::{Target, normalize_target};
-use crate::time::{Clock, Rng, SystemClock, SystemRng};
 use crate::types::oid::Oid;
 use crate::types::value::SnmpValue;
 use crate::types::varbind::{Response, VarBind};
@@ -22,71 +20,13 @@ pub const SYS_UPTIME_OID: [u32; 9] = [1, 3, 6, 1, 2, 1, 1, 3, 0];
 /// The snmpTrapOID.0 instance OID.
 pub const SNMP_TRAP_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0];
 
-/// v1 notifier configuration (← notify/client.py:V1NotifierConfig).
-#[derive(Clone)]
-pub struct V1NotifierConfig {
-    /// Target host.
-    pub host: String,
-    /// Target UDP port.
-    pub port: u16,
-    /// Community string.
-    pub community: String,
-    /// Per-attempt response timeout (default 2s).
-    pub timeout: Duration,
-    /// Retries after the initial attempt (default 1).
-    pub retries: u32,
-    /// Clock seam (default SystemClock).
-    pub clock: Arc<dyn Clock>,
-    /// Randomness seam (default SystemRng).
-    pub rng: Arc<dyn Rng>,
-}
+/// v1 notifier configuration (← notify/client.py:V1NotifierConfig): alias of
+/// [`CommunityConfig`] keeping the architecture §5.5 name public.
+pub type V1NotifierConfig = CommunityConfig;
 
-impl Default for V1NotifierConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 162,
-            community: "public".to_string(),
-            timeout: Duration::from_secs(2),
-            retries: 1,
-            clock: Arc::new(SystemClock),
-            rng: Arc::new(SystemRng),
-        }
-    }
-}
-
-/// v2c notifier configuration (← notify/client.py:V2cNotifierConfig).
-#[derive(Clone)]
-pub struct V2cNotifierConfig {
-    /// Target host.
-    pub host: String,
-    /// Target UDP port.
-    pub port: u16,
-    /// Community string.
-    pub community: String,
-    /// Per-attempt response timeout (default 2s).
-    pub timeout: Duration,
-    /// Retries after the initial attempt (default 1).
-    pub retries: u32,
-    /// Clock seam (default SystemClock).
-    pub clock: Arc<dyn Clock>,
-    /// Randomness seam (default SystemRng).
-    pub rng: Arc<dyn Rng>,
-}
-
-impl Default for V2cNotifierConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 162,
-            community: "public".to_string(),
-            timeout: Duration::from_secs(2),
-            retries: 1,
-            clock: Arc::new(SystemClock),
-            rng: Arc::new(SystemRng),
-        }
-    }
-}
+/// v2c notifier configuration (← notify/client.py:V2cNotifierConfig): alias of
+/// [`CommunityConfig`] keeping the architecture §5.5 name public.
+pub type V2cNotifierConfig = CommunityConfig;
 
 /// v1 TRAP-PDU specification (← notify/client.py:V1TrapSpec).
 #[derive(Clone)]
@@ -131,11 +71,15 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Connects a v1 notifier.
-    pub async fn connect_v1(config: V1NotifierConfig) -> Result<Self, Error> {
+    /// The shared community connect path: build the security model for
+    /// `version` and open a session (← notify/client.py:V1Notifier/V2cNotifier).
+    async fn connect_community(
+        config: CommunityConfig,
+        version: SnmpVersion,
+    ) -> Result<Self, Error> {
         let security = Arc::new(SecurityModel::Community(CommunityModel::new(
             config.community.clone().into_bytes(),
-            SnmpVersion::V1,
+            version,
         )?));
         let session = SnmpSession::connect(SessionConfig {
             host: config.host,
@@ -146,31 +90,17 @@ impl Notifier {
             rng: config.rng,
         })
         .await?;
-        Ok(Self {
-            session,
-            version: SnmpVersion::V1,
-        })
+        Ok(Self { session, version })
+    }
+
+    /// Connects a v1 notifier.
+    pub async fn connect_v1(config: V1NotifierConfig) -> Result<Self, Error> {
+        Self::connect_community(config, SnmpVersion::V1).await
     }
 
     /// Connects a v2c notifier.
     pub async fn connect_v2c(config: V2cNotifierConfig) -> Result<Self, Error> {
-        let security = Arc::new(SecurityModel::Community(CommunityModel::new(
-            config.community.clone().into_bytes(),
-            SnmpVersion::V2c,
-        )?));
-        let session = SnmpSession::connect(SessionConfig {
-            host: config.host,
-            port: config.port,
-            security,
-            timeout: config.timeout,
-            retries: config.retries,
-            rng: config.rng,
-        })
-        .await?;
-        Ok(Self {
-            session,
-            version: SnmpVersion::V2c,
-        })
+        Self::connect_community(config, SnmpVersion::V2c).await
     }
 
     /// Sends a v2c SNMPv2-TRAP and returns the request id

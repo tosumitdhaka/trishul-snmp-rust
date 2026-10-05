@@ -4,86 +4,26 @@ pub mod v1_bulk;
 pub mod walk;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::codec::message::SnmpVersion;
 use crate::codec::pdu::{PduKind, response_error_status};
 use crate::error::Error;
 use crate::manager::walk::WalkOptions;
 use crate::security::SecurityModel;
-use crate::security::community::CommunityModel;
+use crate::security::community::{CommunityConfig, CommunityModel};
 use crate::session::{SessionConfig, SnmpSession};
 use crate::target::{Target, normalize_targets};
-use crate::time::{Clock, Rng, SystemClock, SystemRng};
 use crate::types::oid::Oid;
 use crate::types::value::SnmpValue;
 use crate::types::varbind::{Response, VarBind};
 
-/// v1 manager configuration (← client.py:V1Config).
-#[derive(Clone)]
-pub struct V1Config {
-    /// Remote host.
-    pub host: String,
-    /// Remote UDP port (default 161).
-    pub port: u16,
-    /// Community string.
-    pub community: String,
-    /// Per-attempt response timeout (default 2s).
-    pub timeout: Duration,
-    /// Retries after the initial attempt (default 1).
-    pub retries: u32,
-    /// Clock seam (default SystemClock).
-    pub clock: Arc<dyn Clock>,
-    /// Randomness seam (default SystemRng).
-    pub rng: Arc<dyn Rng>,
-}
+/// v1 manager configuration (← client.py:V1Config): alias of
+/// [`CommunityConfig`] keeping the architecture §5.5 name public.
+pub type V1Config = CommunityConfig;
 
-impl Default for V1Config {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 161,
-            community: "public".to_string(),
-            timeout: Duration::from_secs(2),
-            retries: 1,
-            clock: Arc::new(SystemClock),
-            rng: Arc::new(SystemRng),
-        }
-    }
-}
-
-/// v2c manager configuration (← client.py:V2cConfig).
-#[derive(Clone)]
-pub struct V2cConfig {
-    /// Remote host.
-    pub host: String,
-    /// Remote UDP port (default 161).
-    pub port: u16,
-    /// Community string.
-    pub community: String,
-    /// Per-attempt response timeout (default 2s).
-    pub timeout: Duration,
-    /// Retries after the initial attempt (default 1).
-    pub retries: u32,
-    /// Clock seam (default SystemClock).
-    pub clock: Arc<dyn Clock>,
-    /// Randomness seam (default SystemRng).
-    pub rng: Arc<dyn Rng>,
-}
-
-impl Default for V2cConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 161,
-            community: "public".to_string(),
-            timeout: Duration::from_secs(2),
-            retries: 1,
-            clock: Arc::new(SystemClock),
-            rng: Arc::new(SystemRng),
-        }
-    }
-}
+/// v2c manager configuration (← client.py:V2cConfig): alias of
+/// [`CommunityConfig`] keeping the architecture §5.5 name public.
+pub type V2cConfig = CommunityConfig;
 
 /// SNMP manager for v1/v2c (connect_v3 is Phase 3).
 ///
@@ -100,11 +40,15 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Connects a v1 manager.
-    pub async fn connect_v1(config: V1Config) -> Result<Self, Error> {
+    /// The shared community connect path: build the security model for
+    /// `version` and open a session (← client.py:V1Manager/V2cManager).
+    async fn connect_community(
+        config: CommunityConfig,
+        version: SnmpVersion,
+    ) -> Result<Self, Error> {
         let security = Arc::new(SecurityModel::Community(CommunityModel::new(
             config.community.clone().into_bytes(),
-            SnmpVersion::V1,
+            version,
         )?));
         let session = SnmpSession::connect(SessionConfig {
             host: config.host,
@@ -115,31 +59,17 @@ impl Manager {
             rng: config.rng,
         })
         .await?;
-        Ok(Self {
-            session,
-            version: SnmpVersion::V1,
-        })
+        Ok(Self { session, version })
+    }
+
+    /// Connects a v1 manager.
+    pub async fn connect_v1(config: V1Config) -> Result<Self, Error> {
+        Self::connect_community(config, SnmpVersion::V1).await
     }
 
     /// Connects a v2c manager.
     pub async fn connect_v2c(config: V2cConfig) -> Result<Self, Error> {
-        let security = Arc::new(SecurityModel::Community(CommunityModel::new(
-            config.community.clone().into_bytes(),
-            SnmpVersion::V2c,
-        )?));
-        let session = SnmpSession::connect(SessionConfig {
-            host: config.host,
-            port: config.port,
-            security,
-            timeout: config.timeout,
-            retries: config.retries,
-            rng: config.rng,
-        })
-        .await?;
-        Ok(Self {
-            session,
-            version: SnmpVersion::V2c,
-        })
+        Self::connect_community(config, SnmpVersion::V2c).await
     }
 
     /// Issues a GET request (← client.py:get).
@@ -192,12 +122,7 @@ impl Manager {
         let request_fn = |current: &Oid, max_repetitions: Option<u32>| {
             let this = self;
             let current = current.clone();
-            async move {
-                match max_repetitions {
-                    Some(count) => this.get_bulk_oid(&current, count).await,
-                    None => this.get_next_oid(&current).await,
-                }
-            }
+            async move { this.get_oid(&current, max_repetitions).await }
         };
         crate::manager::walk::walk_subtree(
             request_fn,
@@ -218,30 +143,23 @@ impl Manager {
         self.walk(root, opts).await
     }
 
-    /// Single GETNEXT (used by the walk machinery).
-    pub(crate) async fn get_next_oid(&self, oid: &Oid) -> Result<Response, Error> {
-        let varbinds = vec![VarBind::new(oid.clone(), SnmpValue::Null)];
-        let _guard = self.session.request_lock.lock().await;
-        let pdu = self
-            .session
-            .dispatcher
-            .send_pdu(PduKind::GetNextRequest, varbinds, 0, 0)
-            .await?;
-        response_from_pdu(pdu)
-    }
-
-    /// Single GETBULK (used by the bulk walk machinery).
-    pub(crate) async fn get_bulk_oid(
+    /// Single GETNEXT/GETBULK (used by the walk machinery; `None` = GETNEXT,
+    /// `Some(n)` = GETBULK with `n` repetitions).
+    pub(crate) async fn get_oid(
         &self,
         oid: &Oid,
-        max_repetitions: u32,
+        max_repetitions: Option<u32>,
     ) -> Result<Response, Error> {
         let varbinds = vec![VarBind::new(oid.clone(), SnmpValue::Null)];
         let _guard = self.session.request_lock.lock().await;
+        let (kind, error_index) = match max_repetitions {
+            Some(count) => (PduKind::GetBulkRequest, count as i32),
+            None => (PduKind::GetNextRequest, 0),
+        };
         let pdu = self
             .session
             .dispatcher
-            .send_pdu(PduKind::GetBulkRequest, varbinds, 0, max_repetitions as i32)
+            .send_pdu(kind, varbinds, 0, error_index)
             .await?;
         response_from_pdu(pdu)
     }

@@ -16,30 +16,8 @@ use trishul_snmp::codec::pdu::PduKind;
 use trishul_snmp::error::Error;
 use trishul_snmp::types::varbind::ErrorStatus;
 
-use trishul_snmp::notify::sender::{Notifier, V1NotifierConfig, V1TrapSpec, V2cNotifierConfig};
+use trishul_snmp::notify::sender::{Notifier, V1TrapSpec};
 use trishul_snmp::types::value::SnmpValue;
-
-fn v1_config(port: u16) -> V1NotifierConfig {
-    V1NotifierConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        community: "public".to_string(),
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    }
-}
-
-fn v2c_config(port: u16) -> V2cNotifierConfig {
-    V2cNotifierConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        community: "public".to_string(),
-        timeout: Duration::from_millis(300),
-        retries: 0,
-        ..Default::default()
-    }
-}
 
 /// A notifier over a session whose dispatcher we can inspect.
 fn varbind_target(arcs: &[u32]) -> trishul_snmp::target::Target {
@@ -54,7 +32,7 @@ async fn v2c_send_trap_roundtrip_and_message_shape() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
 
     let extra = vec![
         (
@@ -106,7 +84,7 @@ async fn v2c_send_trap_leaves_no_reserved_request_ids() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
     for _ in 0..3 {
         let _ = notifier
             .send_trap("1.3.6.1.6.3.1.1.5.1", &[], 1)
@@ -128,7 +106,7 @@ async fn v2c_send_trap_applies_explicit_sys_uptime_and_trap_oid() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
     let explicit_trap_oid = oid(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 9]);
     let varbinds = vec![
         (
@@ -163,7 +141,7 @@ async fn v1_send_trap_roundtrip() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let notifier = common::test_v1_notifier(port).await;
     let spec = V1TrapSpec {
         enterprise: varbind_target(&[1, 3, 6, 1, 4, 1, 999]),
         agent_addr: "192.0.2.1".parse().unwrap(),
@@ -202,7 +180,7 @@ async fn v1_send_trap_default_spec_uses_enterprise_specific() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let notifier = common::test_v1_notifier(port).await;
     let spec = V1TrapSpec::default();
     let effective = notifier.send_v1_trap(spec).await.unwrap();
     assert_eq!(effective, 0);
@@ -224,7 +202,7 @@ async fn v1_notifier_rejects_v2c_trap_method() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let notifier = common::test_v1_notifier(port).await;
     let err = notifier
         .send_trap("1.3.6.1.6.3.1.1.5.1", &[], 1)
         .await
@@ -244,7 +222,7 @@ async fn v2c_notifier_rejects_v1_trap_method() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
     let err = notifier
         .send_v1_trap(V1TrapSpec::default())
         .await
@@ -261,7 +239,7 @@ async fn v1_notifier_rejects_inform() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let notifier = common::test_v1_notifier(port).await;
     let err = notifier
         .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
         .await
@@ -278,7 +256,7 @@ async fn v2c_send_inform_roundtrip() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
     let response = notifier
         .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 456)
         .await
@@ -312,15 +290,8 @@ async fn v2c_send_inform_waiting_for_response_times_out_when_agent_is_silent() {
             }
         }
     });
-    let notifier = Notifier::connect_v2c(V2cNotifierConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        timeout: Duration::from_millis(100),
-        retries: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let notifier =
+        common::test_v2c_notifier_with(port, "public", Duration::from_millis(100), 0).await;
     let err = notifier
         .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
         .await
@@ -339,7 +310,7 @@ async fn v1_send_trap_applies_sys_uptime_override() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let notifier = common::test_v1_notifier(port).await;
     let spec = V1TrapSpec {
         enterprise: varbind_target(&[1, 3, 6, 1, 4, 1, 999]),
         timestamp: 0,
@@ -461,7 +432,7 @@ async fn send_trap_rejects_symbolic_varbind_targets_without_bundle() {
         false,
     ))
     .await;
-    let notifier = Notifier::connect_v2c(v2c_config(port)).await.unwrap();
+    let notifier = common::test_v2c_notifier(port).await;
     let symbolic = trishul_snmp::target::Target::from_str("IF-MIB::ifDescr.1").unwrap();
     let varbinds = vec![(symbolic, SnmpValue::Integer(1))];
     let err = notifier

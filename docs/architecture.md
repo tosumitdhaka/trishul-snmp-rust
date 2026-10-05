@@ -383,6 +383,14 @@ impl Manager {
 }
 ```
 
+**Constructor shape (leaner than the sketch)**: the v1/v2c configs are aliases of one
+`CommunityConfig` (`pub type V1Config = CommunityConfig;` etc. — the §5.5 names stay
+public), and `connect_v1`/`connect_v2c` delegate to a shared private
+`connect_community(cfg, version)` in each of Manager and Notifier; `V3Config` is a
+genuinely distinct struct (Phase 3). The single shared `Default` carries the manager's
+port 161; trap senders set the notifier port explicitly. Behavior identical to the
+"6 constructors + 6 config structs" reading of the sketch.
+
 **Lifecycle**: async `connect()` constructors (socket + USM discovery — the reference's
 `session.open()` including the `prepare` hook, `session.py:53–63`); teardown is `Drop`.
 No async context manager and no explicit `close()` — dropping the tokio `UdpSocket`
@@ -531,8 +539,9 @@ once, then propagates. One retry, no flag polling, identical semantics.
 
 ## 7. Seams: Clock and RNG
 
-Two tiny traits in `time.rs`, `Arc<dyn _>`-injected, defaulted in every config. These
-replace the monkeypatch surfaces of the Python test suite.
+Two tiny traits in `time.rs`, `Arc<dyn _>`-injected via the configs of Clock
+*consumers* (see the table below) — not defaulted into configs that have no
+consumer. These replace the monkeypatch surfaces of the Python test suite.
 
 ```rust
 pub trait Clock: Send + Sync {
