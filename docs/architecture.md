@@ -274,13 +274,25 @@ pins) plus the independent ora-3 source review:
    i64 sign-inversion on `00 FF…×8` → −1). A manual impl decoding via
    `rasn::types::Any` (`as_bytes()` preserves the raw content slice) applies the
    exact `asn1.py:132–182` rules: unsigned minimality (re-encode compare),
-   u32/u64 width bounds, 4-octet IpAddress. ~100–200 LOC. `Encode` stays derived
-   — encoder parity is byte-exact (minimal lengths, leading-`00` for MSB; pinned
-   in `tests/rasn_pins.rs`).
+   u32/u64 width bounds, 4-octet IpAddress. ~100–200 LOC. **`Encode` is manual
+   too** (implementation finding, Phase 1): rasn's derived `Vec<u8>` encoder
+   emits SEQUENCE OF, not OCTET STRING (`enc.rs:1033–1045`, no special case);
+   the manual encoder is byte-exact — minimal lengths, leading-`00` for MSB —
+   proven by the 26 golden cases.
 4. **`validate.rs` scope** shrinks to what post-decode state can actually see:
    OID arc/first-arc rules on the typed side, V1 trap-field ranges,
    tag-vs-privParams agreement. Unsigned minimality moved into the manual
    `Decode` (item 3).
+5. **Varbind lists decode strictly, manually.** rasn's `decode_sequence_of`
+   silently DROPS a malformed element whose error occurs after its TLV is fully
+   consumed — e.g. a well-framed empty INTEGER: the element loop breaks on the
+   first error and returns the decoded prefix (`ber/de.rs:732–765`, both
+   modes), and the extent check finds nothing left to reject. Tag mismatches,
+   by contrast, leave the tag byte unconsumed and surface as
+   `UnexpectedExtraData`. A malformed trailing varbind would therefore vanish
+   instead of failing the message; `RawVarbindList` walks the content with the
+   strict TLV decoder and errors on any framing/tag/content mismatch. Pinned
+   in `tests/rasn_pins.rs` (pin #9).
 
 ### 5.4 Security model — enum dispatch
 
@@ -563,7 +575,9 @@ state, which tokio cannot provide.
 | Typed `UnwrapOutcome` + `EngineRecovery` variant | exception/flag/getattr flow | Locked decision |
 | `BTreeMap` responder source | dict + sorted list + bisect/insort | `range()` gives lexicographic next directly |
 | One `Manager` + version | V1/V2c/V3Manager classes | No inheritance in Rust |
-| `Integer(i64)` bound | unbounded Python int | Manual `Decode` rejects over-width/non-minimal unsigned content exactly as `asn1.py:178–179`; magnitude beyond i64 → Malformed |
+| `Integer(i64)` bound | unbounded Python int | Manual `Decode` rejects over-width/non-minimal unsigned content exactly as `asn1.py:178–179`; signed INTEGER content longer than 8 octets → Malformed (even when magnitude fits i64) |
+| PDU header INTEGERs decode via rasn i64 path | reference's hand decoder rejects over-width | `request_id`/`error_status`/trap fields accept 9-octet content (decodes to u32::MAX image) where values reject it; no reference test covers; converge in Phase 3 |
+| OctetString display uses `!is_control()` | `isprintable()` | Format/line-separator code points render as text instead of hex; documented in code |
 | Early OID arc rejection in `Oid::from_arcs` | parse accepts large arcs, fails only at encode | Strictly earlier failure point; harmless |
 | Listener `on_error` callback dropped | per-drop callback (listener.py:60) | `drop_counts()` polling replaces it |
 | `Pdu.request_id: u32` | signed int preserved on decode | Negative INTEGER content reinterpreted as its unsigned image; no reference test covers it, practice never sends negative ids |

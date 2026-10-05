@@ -79,3 +79,18 @@ fn rasn_encode_is_minimal_with_leading_zero_for_msb() {
     assert_eq!(ber::encode(&u32::MAX).unwrap(), hex("02 05 00 FF FF FF FF"));
     assert_eq!(ber::encode(&127u32).unwrap(), hex("02 01 7F"));
 }
+
+#[test]
+fn rasn_decode_sequence_of_silently_drops_malformed_tail() {
+    // SEQUENCE OF INTEGER `30 05 02 01 05 02 00`: element 1 decodes (5); the
+    // second is a well-framed but EMPTY INTEGER — its decode consumes the whole
+    // TLV then fails, the element loop breaks (ber/de.rs decode_sequence_of),
+    // the extent is fully consumed, and rasn returns Ok([5]) with the
+    // malformed element silently dropped, in BOTH modes. This is why the
+    // varbind list has a manual strict codec (architecture §5.3a item 5).
+    // Contrast: a tag-MISMATCH error leaves the tag byte unconsumed and
+    // surfaces immediately as UnexpectedExtraData.
+    let b = hex("30 05 02 01 05 02 00");
+    assert_eq!(ber::decode::<Vec<u32>>(&b).unwrap(), vec![5]);
+    assert_eq!(der::decode::<Vec<u32>>(&b).unwrap(), vec![5]);
+}

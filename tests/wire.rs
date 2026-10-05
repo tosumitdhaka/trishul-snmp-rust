@@ -302,6 +302,61 @@ fn decode_value_rejects_counter32_beyond_bound() {
 }
 
 #[test]
+fn decode_value_rejects_gauge32_beyond_bound() {
+    let data = [vec![0x42, 0x05], (1u64 << 32).to_be_bytes()[3..].to_vec()].concat();
+    let err = decode_value(&data).unwrap_err();
+    assert_eq!(
+        err.message,
+        "Gauge32 value 4294967296 exceeds maximum 4294967295"
+    );
+}
+
+#[test]
+fn decode_value_rejects_timeticks_beyond_bound() {
+    let data = [vec![0x43, 0x05], (1u64 << 32).to_be_bytes()[3..].to_vec()].concat();
+    let err = decode_value(&data).unwrap_err();
+    assert_eq!(
+        err.message,
+        "TimeTicks value 4294967296 exceeds maximum 4294967295"
+    );
+}
+
+#[test]
+fn decode_value_rejects_overwidth_signed_integer() {
+    // The exact vector pinned as rasn's silent corruption in tests/rasn_pins.rs
+    // (over-width strip → -1): our manual decoder must reject it instead
+    // (content length > 8 octets, even though the magnitude would fit).
+    let err = decode_value(&hex("020900FFFFFFFFFFFFFFFF")).unwrap_err();
+    assert_eq!(err.message, "INTEGER content exceeds i64 bounds");
+}
+
+#[test]
+fn bulk_field_getters_saturate_negative_raw_values() {
+    // Architecture §5.3: getters saturate negative raw values to 0 (no
+    // reference coverage — pins our own type contract).
+    let pdu = Pdu {
+        kind: PduKind::GetBulkRequest,
+        request_id: 7,
+        error_status: -5,
+        error_index: -3,
+        varbinds: Vec::new(),
+        v1_trap: None,
+    };
+    assert_eq!(pdu.non_repeaters(), 0);
+    assert_eq!(pdu.max_repetitions(), 0);
+    let pdu = Pdu {
+        kind: PduKind::GetBulkRequest,
+        request_id: 7,
+        error_status: 2,
+        error_index: 10,
+        varbinds: Vec::new(),
+        v1_trap: None,
+    };
+    assert_eq!(pdu.non_repeaters(), 2);
+    assert_eq!(pdu.max_repetitions(), 10);
+}
+
+#[test]
 fn encode_value_accepts_exact_unsigned_bounds() {
     for value in [
         SnmpValue::Counter32(u32::MAX),
