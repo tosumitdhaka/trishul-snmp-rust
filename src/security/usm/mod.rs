@@ -446,6 +446,128 @@ impl UsmModel {
         SnmpVersion::V3
     }
 
+    // ── listener/offline decode support (← notify/v3.py helpers) ─────────────
+
+    /// The truncated-HMAC tag length for the configured auth protocol
+    /// (notify/v3.py:317–323 length check).
+    #[must_use]
+    pub fn auth_tag_len(&self) -> usize {
+        auth_tag_length(self.user.auth_protocol)
+    }
+
+    /// Verifies the HMAC over a received datagram using the configured user's
+    /// key for `engine_id` (notify/v3.py `codec._verify_auth`). Key derivation
+    /// runs under the lock; the CPU-bound verification happens outside it.
+    pub fn verify_auth(
+        &self,
+        data: &[u8],
+        offset: usize,
+        received_tag: &[u8],
+        engine_id: &[u8],
+    ) -> Result<(), Error> {
+        if !auth_enabled(self.user.auth_protocol) {
+            return Ok(());
+        }
+        let key = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.auth_key(engine_id, &mut state)?
+        };
+        auth::verify_auth(data, offset, received_tag, &key, self.user.auth_protocol)
+    }
+
+    /// Decrypts an inbound encryptedPDU for the message's authoritative engine
+    /// (notify/v3.py `codec._decrypt_scoped_pdu`). Negative boots/time on the
+    /// wire clamp to 0, matching `unwrap_message`.
+    pub fn decrypt_scoped_pdu(
+        &self,
+        msg_data: &[u8],
+        priv_params: &[u8],
+        engine_id: &[u8],
+        engine_boots: i64,
+        engine_time: i64,
+    ) -> Result<Vec<u8>, Error> {
+        let key = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.priv_key(engine_id, &mut state)?
+        };
+        privacy::decrypt_for_protocol(
+            &key,
+            msg_data,
+            engine_boots.max(0) as u32,
+            engine_time.max(0) as u32,
+            priv_params,
+            self.user.priv_protocol,
+        )
+    }
+
+    /// Encrypts an outbound ScopedPDU under `engine`'s authority, returning
+    /// `(priv_params, msg_data)` where `msg_data` is the encryptedPDU OCTET
+    /// STRING TLV (notify/v3.py `codec._encrypt_scoped_pdu`). Used by the
+    /// listener's inform RESPONSE path.
+    pub fn encrypt_scoped_pdu(
+        &self,
+        scoped: &[u8],
+        engine: &UsmLocalEngine,
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        let (key, salt) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let key = self.priv_key(&engine.engine_id, &mut state)?;
+            let salt = if self.user.priv_protocol == PrivProtocol::Des3Ede {
+                privacy::fresh_cbc_salt(&*self.rng, &mut state.last_cbc_salt_first_octet)
+            } else {
+                privacy::fresh_aes_salt(&*self.rng)
+            };
+            (key, salt)
+        };
+        let ciphertext = privacy::encrypt_for_protocol(
+            &key,
+            scoped,
+            engine.engine_boots,
+            engine.engine_time,
+            &salt,
+            self.user.priv_protocol,
+        )?;
+        let msg_data = crate::codec::encode_tlv(0x04, &ciphertext)?;
+        Ok((salt.to_vec(), msg_data))
+    }
+
+    /// Splices the computed HMAC into a message whose auth placeholder is
+    /// already zero-filled (notify/v3.py `codec._stamp_auth`). Used by the
+    /// inform RESPONSE path and loopback test fixtures.
+    pub fn stamp_auth(&self, raw: &[u8], engine_id: &[u8]) -> Result<Vec<u8>, Error> {
+        let key = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.auth_key(engine_id, &mut state)?
+        };
+        auth::stamp_auth(raw, &key, self.user.auth_protocol)
+    }
+
+    /// Builds the RFC 3414 discovery probe this model would send
+    /// (← `_build_discovery_probe`); used by loopback listener fixtures to
+    /// exercise the discovery REPORT path.
+    pub fn build_discovery_probe(&self) -> Result<Vec<u8>, Error> {
+        let msg_id = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.next_msg_id()
+        };
+        build_discovery_probe(msg_id)
+    }
+
     // ── engine discovery ──────────────────────────────────────────────────
 
     /// Performs RFC 3414 engine discovery: sends a noAuthNoPriv probe with an

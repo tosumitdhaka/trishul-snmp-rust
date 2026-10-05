@@ -532,6 +532,104 @@ fn version_marker_compiles() {
     let _ = PduKind::GetRequest;
 }
 
+/// The coldStart notification OID (1.3.6.1.6.3.1.1.5.1) — the Phase 5 gate's
+/// "snmpd coldStart trap + inform fixtures" (test_snmpd_integration.py:74).
+const COLDSTART_OID: &str = "1.3.6.1.6.3.1.1.5.1";
+
+/// Starts a dedicated snmpd whose coldStart fires into a bound listener.
+///
+/// The listener binds *before* the agent starts, so the one-shot coldStart v1
+/// trap, v2c trap, and inform are all captured. The listener auto-ACKs the
+/// inform (the v2c inform ack path); snmpd would otherwise retry it
+/// (test_snmpd_integration.py:369–419).
+#[tokio::test]
+async fn conformance_snmpd_coldstart_notifications() {
+    if !gate_open() {
+        eprintln!("TSNMP_SNMPD unset: skipping snmpd coldStart notification suite");
+        return;
+    }
+    let listener = trishul_snmp::notify::listener::NotificationListener::bind(
+        trishul_snmp::notify::listener::ListenerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            communities: Some(vec![b"public".to_vec()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("bind the notification listener");
+    let sink_port = listener.local_addr().port();
+    let conf = format!(
+        "rocommunity public 127.0.0.1\n\
+         agentaddress 127.0.0.1:0\n\
+         engineID tsnmpv3notifyengine\n\
+         trapsink 127.0.0.1:{sink_port} public\n\
+         trap2sink 127.0.0.1:{sink_port} public\n\
+         informsink 127.0.0.1:{sink_port} public\n"
+    );
+    let Some((agent, _workdir)) = spawn_snmpd(&conf, "notify") else {
+        eprintln!("conformance: cannot spawn snmpd for coldStart notifications; skipping");
+        return;
+    };
+
+    // Collect the v1 trap, v2c trap, and inform. Informs are retried by snmpd
+    // until the listener's ACK lands, so tolerate duplicates while collecting
+    // the three distinct pdu_types.
+    let mut events = std::collections::HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while events.len() < 3 && tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(event))) =
+            tokio::time::timeout(Duration::from_secs(5), listener.recv()).await
+        else {
+            continue;
+        };
+        events.insert(event.pdu_type.clone(), event);
+    }
+    let expected: std::collections::HashSet<&str> = ["trap", "snmpv2-trap", "inform-request"]
+        .into_iter()
+        .collect();
+    let got: std::collections::HashSet<&str> = events.keys().map(String::as_str).collect();
+    assert_eq!(
+        got, expected,
+        "expected coldStart notifications {:?}, got {:?}",
+        expected, got
+    );
+
+    // v1 Trap-PDU metadata (test_snmpd_integration.py:422–434).
+    let v1 = &events["trap"];
+    assert_eq!(v1.community.as_deref(), Some(b"public".as_slice()));
+    assert_eq!(v1.source_host().as_deref(), Some("127.0.0.1"));
+    assert_eq!(v1.generic_trap, Some(0)); // coldStart
+    assert!(v1.enterprise.is_some(), "v1 enterprise present");
+    assert!(v1.agent_addr.is_some(), "v1 agent_addr present");
+    assert!(v1.timestamp.is_some(), "v1 Trap-PDU sysUpTime present");
+
+    // v2c trap (test_snmpd_integration.py:437–445).
+    let v2c = &events["snmpv2-trap"];
+    assert_eq!(
+        v2c.notification_oid.as_ref().map(Oid::display).as_deref(),
+        Some(COLDSTART_OID)
+    );
+    assert!(v2c.uptime.is_some(), "v2c uptime present");
+
+    // Inform, auto-acked (test_snmpd_integration.py:448–463).
+    let inform = &events["inform-request"];
+    assert!(inform.is_inform());
+    assert_eq!(
+        inform
+            .notification_oid
+            .as_ref()
+            .map(Oid::display)
+            .as_deref(),
+        Some(COLDSTART_OID)
+    );
+    assert!(inform.uptime.is_some(), "inform uptime present");
+
+    drop(listener);
+    agent.kill();
+    eprintln!("conformance: snmpd coldStart v1/v2c traps + inform passed against live snmpd");
+}
+
 // ── v3 conformance helpers ──────────────────────────────────────────────────
 
 fn v3_user(username: &str, auth: AuthProtocol) -> UsmUser {

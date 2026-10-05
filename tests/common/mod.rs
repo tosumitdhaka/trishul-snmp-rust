@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod fake;
+pub mod notify;
 pub mod transport;
 
 use std::sync::Arc;

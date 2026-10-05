@@ -27,6 +27,23 @@ pub enum AuthProtocol {
     Sha512,
 }
 
+impl AuthProtocol {
+    /// The reference's `AuthProtocol.X.name` label (used in error messages,
+    /// e.g. notify/v3.py:319).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None_ => "NONE",
+            Self::Md5 => "MD5",
+            Self::Sha1 => "SHA1",
+            Self::Sha224 => "SHA224",
+            Self::Sha256 => "SHA256",
+            Self::Sha384 => "SHA384",
+            Self::Sha512 => "SHA512",
+        }
+    }
+}
+
 /// USM privacy protocols. DES-CBC is locked out (architecture §1); the AES
 /// and 3DES variants gate in Phase 4 (priv.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
