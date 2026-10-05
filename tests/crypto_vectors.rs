@@ -15,7 +15,9 @@
 
 use std::fs;
 
+use trishul_snmp::security::usm::kdf::PrivProtocol;
 use trishul_snmp::security::usm::kdf::{AuthProtocol, localize_key, password_to_ku};
+use trishul_snmp::security::usm::privacy::localized_priv_key;
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -53,6 +55,7 @@ fn parse_toml(raw: &str) -> Vec<TomlRecord> {
         {
             let value = value.trim();
             let value = value.split('"').nth(1).unwrap_or(value);
+            let value = value.split('#').next().unwrap_or(value).trim();
             record.1.push((key.trim().to_string(), value.to_string()));
         }
     }
@@ -94,60 +97,6 @@ fn protocol_of(name: &str) -> AuthProtocol {
         "SHA384" => AuthProtocol::Sha384,
         "SHA512" => AuthProtocol::Sha512,
         other => panic!("unknown protocol {other}"),
-    }
-}
-
-/// Test-side mirror of usm.py:_extend_localized_key
-/// (draft-blumenthal-aes-usm-04 §3.1.2.2): truncate to `length`, or extend a
-/// shorter key by repeatedly appending `H(accumulated buffer)`. The
-/// production copy lands in priv.rs (Phase 4).
-fn extend_localized_key(key: &[u8], length: usize, protocol: AuthProtocol) -> Vec<u8> {
-    if key.len() >= length {
-        return key[..length].to_vec();
-    }
-    let mut extended = key.to_vec();
-    while extended.len() < length {
-        let input = extended.clone();
-        let digest = hash_digest(&input, protocol);
-        extended.extend_from_slice(&digest);
-    }
-    extended[..length].to_vec()
-}
-
-fn hash_digest(data: &[u8], protocol: AuthProtocol) -> Vec<u8> {
-    use hmac::digest::Digest;
-    match protocol {
-        AuthProtocol::Md5 => {
-            let mut h = md5::Md5::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::Sha1 => {
-            let mut h = sha1::Sha1::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::Sha224 => {
-            let mut h = sha2::Sha224::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::Sha256 => {
-            let mut h = sha2::Sha256::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::Sha384 => {
-            let mut h = sha2::Sha384::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::Sha512 => {
-            let mut h = sha2::Sha512::new();
-            h.update(data);
-            h.finalize().to_vec()
-        }
-        AuthProtocol::None_ => Vec::new(),
     }
 }
 
@@ -201,13 +150,21 @@ fn netsnmp_localized_priv_key_vectors() {
         let expected = hex(field(case, "expected_localized_priv_key"));
         let key_length = expected.len();
 
-        // RFC 3414 localization (Phase-3 KDF) at the auth digest length...
-        let localized = localize_key(priv_password, &engine_id, auth).unwrap();
-        // ... then the Blumenthal truncate/extend (test-side mirror).
-        let key = extend_localized_key(&localized, key_length, auth);
+        // Production derivation (Phase 4 priv.rs): localize the digest-length
+        // Ku, then truncate/extend the LOCALIZED key (net-snmp semantics).
+        let protocol = if key_length == 24 {
+            PrivProtocol::Aes192
+        } else {
+            PrivProtocol::Aes256
+        };
+        let key = localized_priv_key(priv_password, &engine_id, auth, protocol).unwrap();
 
         let name = field(case, "name");
-        assert_eq!(key, expected, "net-snmp localized key vector {name}");
+        assert_eq!(
+            key.as_slice(),
+            expected.as_slice(),
+            "net-snmp localized key vector {name}"
+        );
     }
 }
 
@@ -224,25 +181,30 @@ fn netsnmp_control_case_localized_key_is_full_cipher_key() {
     );
 }
 
-// ── reeder Appendix B chains (gated to Phase 4) ─────────────────────────────
+// ── reeder Appendix B chains (production 3DES derivation) ───────────────────
 
 #[test]
-fn reeder_appendix_b_vectors_are_present_for_phase_4() {
-    // Phase 3 consumes the fixture's presence; the 3DES chain derivation is
-    // asserted in Phase 4 (priv.rs) against the same vectors.toml.
+fn reeder_appendix_b_3des_chains_byte_exact() {
+    // draft-reeder-snmpv3-usm-3desede-00 Appendix B, via the production
+    // chain (priv.rs localized_priv_key): K1 = RFC 3414 localized key,
+    // K2 = P2K(K1) localized, key = (K1 || K2)[:32].
     let cases = records_for("reeder_3des_appendix_b");
     assert_eq!(cases.len(), 2, "two reeder vectors");
-    // The RFC 3414 K1 of each chain is verifiable today:
     let engine = hex("000000000000000000000002");
     for case in &cases {
         let auth = protocol_of(field(case, "auth_protocol"));
-        let kul = localize_key(b"maplesyrup", &engine, auth).unwrap();
+        // The fixture records the draft's full Appendix B literal; the 3DES
+        // key material is its first `key_material_octets` (32).
         let chain = hex(field(case, "chain_hex"));
+        let octets: usize = field(case, "key_material_octets").parse().unwrap();
+        let expected = chain[..octets].to_vec();
+        let key = localized_priv_key(b"maplesyrup", &engine, auth, PrivProtocol::Des3Ede).unwrap();
+        let name = field(case, "name");
         assert_eq!(
-            kul.as_slice(),
-            &chain[..kul.len()],
-            "{} chain K1 is the RFC 3414 localized key",
-            field(case, "name")
+            key.as_slice(),
+            expected.as_slice(),
+            "reeder 3DES chain vector {name}"
         );
+        assert_eq!(key.len(), 32, "{name}: 3DES key material is 32 octets");
     }
 }

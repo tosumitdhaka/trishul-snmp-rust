@@ -113,6 +113,7 @@ impl Notifier {
             config.context_name,
             config.local_engine.clone(),
             Arc::clone(&config.clock),
+            config.rng.clone(),
         );
         let security = Arc::new(SecurityModel::Usm(model));
         let session = SnmpSession::connect(SessionConfig {

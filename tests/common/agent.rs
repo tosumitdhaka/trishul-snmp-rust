@@ -489,7 +489,13 @@ pub fn usm_agent_model(
 ) -> UsmModel {
     use std::sync::Arc;
     use trishul_snmp::time::SystemClock;
-    let model = UsmModel::new(user, Vec::new(), None, Arc::new(SystemClock));
+    let model = UsmModel::new(
+        user,
+        Vec::new(),
+        None,
+        Arc::new(SystemClock),
+        Arc::new(crate::common::fake::CounterRng::new(7)),
+    );
     model.adopt_engine_state(engine_id, engine_boots, engine_time);
     model
 }

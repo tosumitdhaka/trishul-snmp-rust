@@ -259,6 +259,7 @@ impl Manager {
             config.context_name,
             config.local_engine,
             Arc::clone(&config.clock),
+            config.rng.clone(),
         );
         let security = Arc::new(SecurityModel::Usm(model));
         let session = SnmpSession::connect(SessionConfig {

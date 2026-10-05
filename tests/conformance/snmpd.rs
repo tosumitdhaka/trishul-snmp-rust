@@ -21,12 +21,14 @@ use trishul_snmp::manager::Manager;
 use trishul_snmp::manager::walk::WalkOptions;
 use trishul_snmp::security::usm::kdf::{AuthProtocol, PrivProtocol};
 use trishul_snmp::security::usm::{AuthKey, PrivKey, UsmUser, V3Config};
+use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::ErrorStatus;
 
 const AGENT_PORT: u16 = 1161;
 const SYSTEM_ROOT: &str = "1.3.6.1.2.1.1";
 const SYS_UPTIME_INSTANCE: &str = "1.3.6.1.2.1.1.3.0";
+const OID_SYS_DESCR_INSTANCE: &str = "1.3.6.1.2.1.1.1.0";
 const SYS_DESCR_INSTANCE: &str = "1.3.6.1.2.1.1.1.0";
 
 /// Whether the gate is open (TSNMP_SNMPD set to exactly "1").
@@ -90,7 +92,30 @@ fn v3_conf(port: u16) -> String {
 const V3_PORT: u16 = 1162;
 
 /// Spawns a snmpd with `conf`; returns the child plus the working directory.
-fn spawn_snmpd(conf: &str, name: &str) -> Option<(Child, PathBuf)> {
+/// Kills the snmpd child on drop so a panicking test cannot leak an agent.
+struct AgentGuard(Child);
+
+impl AgentGuard {
+    /// Whether the child has exited (bind failures exit immediately).
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().ok().flatten()
+    }
+
+    /// Kills and reaps the child, consuming the guard.
+    fn kill(mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for AgentGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_snmpd(conf: &str, name: &str) -> Option<(AgentGuard, PathBuf)> {
     let workdir = manifest_dir().join(format!("target/snmpd-conformance/{name}"));
     std::fs::create_dir_all(&workdir).ok()?;
     let conf_path = workdir.join("snmpd.conf");
@@ -110,11 +135,11 @@ fn spawn_snmpd(conf: &str, name: &str) -> Option<(Child, PathBuf)> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    Some((child, workdir))
+    Some((AgentGuard(child), workdir))
 }
 
 /// Spawns the adapted agent; returns the child plus the working directory.
-fn spawn_agent() -> Option<(Child, PathBuf)> {
+fn spawn_agent() -> Option<(AgentGuard, PathBuf)> {
     spawn_snmpd(&adapted_conf(), "main")
 }
 
@@ -148,11 +173,10 @@ async fn conformance_v1_v2c_get_getnext_getbulk_walk() {
         return;
     }
 
-    let (mut agent, _workdir) = spawn_agent().expect("snmpd must be available and spawnable");
+    let (agent, _workdir) = spawn_agent().expect("snmpd must be available and spawnable");
     let ready = wait_for_agent(Duration::from_secs(10)).await;
     if !ready {
-        let _ = agent.kill();
-        let _ = agent.wait();
+        agent.kill();
         panic!("snmpd agent did not become ready on 127.0.0.1:{AGENT_PORT}");
     }
 
@@ -262,8 +286,7 @@ async fn conformance_v1_v2c_get_getnext_getbulk_walk() {
     );
 
     // Teardown.
-    let _ = agent.kill();
-    let _ = agent.wait();
+    agent.kill();
     eprintln!("conformance: v1/v2c get/getnext/getbulk/walk passed against live snmpd");
 }
 
@@ -279,8 +302,8 @@ async fn conformance_v3_authnopriv_matrix() {
         return;
     };
     // A v3 agent that exits immediately means the bind failed (port in use).
-    if let Some(_status) = agent.try_wait().ok().flatten() {
-        let _ = agent.kill();
+    if let Some(_status) = agent.try_wait() {
+        drop(agent);
         eprintln!(
             "conformance: v3 agent on {port} exited immediately (port in use?); skipping v3 suite"
         );
@@ -304,8 +327,7 @@ async fn conformance_v3_authnopriv_matrix() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !ready {
-        let _ = agent.kill();
-        let _ = agent.wait();
+        agent.kill();
         panic!("snmpd v3 agent did not become ready on 127.0.0.1:{port}");
     }
 
@@ -338,9 +360,117 @@ async fn conformance_v3_authnopriv_matrix() {
         );
     }
 
-    let _ = agent.kill();
-    let _ = agent.wait();
+    agent.kill();
     eprintln!("conformance: v3 authNoPriv matrix passed against live snmpd");
+}
+
+#[tokio::test]
+async fn conformance_v3_authpriv_matrix() {
+    if !gate_open() {
+        eprintln!("TSNMP_SNMPD unset: skipping snmpd v3 authPriv conformance suite");
+        return;
+    }
+    let port = V3_PORT;
+    let Some((mut agent, _workdir)) = spawn_snmpd(&v3_conf(port), "v3priv") else {
+        eprintln!("conformance: cannot spawn snmpd for the v3 authPriv agent on {port}; skipping");
+        return;
+    };
+    if let Some(_status) = agent.try_wait() {
+        drop(agent);
+        eprintln!(
+            "conformance: v3 authPriv agent on {port} exited immediately (port in use?); skipping"
+        );
+        return;
+    }
+    // authPriv users from the fixture's createUser rows. v3view is excluded
+    // deliberately: the fixture's `access restgroup "" any noauth exact …` row
+    // restricts that user to noAuth requests, so an authPriv GET is rejected
+    // with AuthorizationError by design.
+    let matrix = [
+        ("tsnmpuser", AuthProtocol::Sha256, PrivProtocol::Aes256),
+        ("user224", AuthProtocol::Sha224, PrivProtocol::Aes256),
+        ("user384", AuthProtocol::Sha384, PrivProtocol::Aes192),
+        ("user512", AuthProtocol::Sha512, PrivProtocol::Aes256),
+        (
+            "userSha256Aes192",
+            AuthProtocol::Sha256,
+            PrivProtocol::Aes192,
+        ),
+        ("v3only", AuthProtocol::Sha256, PrivProtocol::Aes128),
+    ];
+    for (username, auth, priv_protocol) in matrix {
+        let user = v3_authpriv_user(username, auth, priv_protocol, "privpassword12345");
+        // Readiness per user: discovery + an authed+priv'd get.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let manager = loop {
+            let Ok(manager) = Manager::connect_v3(v3_config(port, user.clone())).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            if manager.get(vec![SYS_UPTIME_INSTANCE]).await.is_ok() {
+                break manager;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                agent.kill();
+                panic!("{username}: authPriv agent never became ready");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // get: sysUpTime.0 is TimeTicks.
+        let response = manager
+            .get(vec![SYS_UPTIME_INSTANCE])
+            .await
+            .unwrap_or_else(|e| panic!("{username}: authPriv get failed: {e}"));
+        assert_eq!(
+            response.error_status,
+            ErrorStatus::NoError,
+            "{username}: get rejected"
+        );
+        assert!(
+            matches!(response.varbinds[0].value, SnmpValue::TimeTicks(_)),
+            "{username}: sysUpTime expected"
+        );
+        // getnext: sysDescr.0 -> sysObjectID.0
+        let response = manager
+            .get_next(vec![OID_SYS_DESCR_INSTANCE])
+            .await
+            .unwrap_or_else(|e| panic!("{username}: getnext failed: {e}"));
+        assert_eq!(
+            response.varbinds[0].oid,
+            Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 2, 0]).unwrap(),
+            "{username}: getnext successor"
+        );
+        // getbulk: the system subtree in one shot.
+        let response = manager
+            .get_bulk(vec![OID_SYS_DESCR_INSTANCE], 0, 5)
+            .await
+            .unwrap_or_else(|e| panic!("{username}: getbulk failed: {e}"));
+        assert_eq!(
+            response.error_status,
+            ErrorStatus::NoError,
+            "{username}: getbulk rejected"
+        );
+        assert!(
+            response.varbinds.len() >= 3,
+            "{username}: getbulk returned {} varbinds",
+            response.varbinds.len()
+        );
+        // walk: the whole system subtree.
+        let walked = manager
+            .walk(
+                [1, 3, 6, 1, 2, 1, 1].as_slice(),
+                trishul_snmp::manager::walk::WalkOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{username}: authPriv walk failed: {e}"));
+        assert!(
+            walked.len() >= 7,
+            "{username}: system subtree walk returned {} varbinds",
+            walked.len()
+        );
+    }
+    agent.kill();
+    eprintln!("conformance: v3 authPriv matrix passed against live snmpd");
 }
 
 #[test]
@@ -354,12 +484,23 @@ fn version_marker_compiles() {
 // ── v3 conformance helpers ──────────────────────────────────────────────────
 
 fn v3_user(username: &str, auth: AuthProtocol) -> UsmUser {
+    v3_authpriv_user(username, auth, PrivProtocol::None_, "")
+}
+
+/// An authPriv user matching the fixture's createUser rows
+/// (auth "authpassword12345", priv "privpassword12345").
+fn v3_authpriv_user(
+    username: &str,
+    auth: AuthProtocol,
+    priv_protocol: PrivProtocol,
+    _priv_password: &str,
+) -> UsmUser {
     UsmUser::new(
         username.to_string(),
         auth,
         AuthKey::Passphrase(b"authpassword12345".to_vec()),
-        PrivProtocol::None_,
-        PrivKey::Passphrase(Vec::new()),
+        priv_protocol,
+        PrivKey::Passphrase(b"privpassword12345".to_vec()),
     )
     .unwrap()
 }

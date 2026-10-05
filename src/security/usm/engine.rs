@@ -148,6 +148,12 @@ pub(crate) struct UsmEngineState {
     pub(crate) ku_cache: HashMap<(AuthProtocol, KeyMaterial), Zeroizing<Vec<u8>>>,
     /// Bounded LRU of localized auth keys keyed by `engine_id || password`.
     pub(crate) localized_cache: KeyCache,
+    /// Bounded LRU of localized privacy keys keyed by `protocol || engine_id || password`
+    /// (usm.py:_localized_priv_cache).
+    pub(crate) priv_key_cache: KeyCache,
+    /// First octet of the last CBC (3DES) salt, for the first-octet change
+    /// rule (usm.py:_fresh_cbc_salt).
+    pub(crate) last_cbc_salt_first_octet: Option<u8>,
     /// Message id counter.
     pub(crate) msg_id_counter: u32,
 }

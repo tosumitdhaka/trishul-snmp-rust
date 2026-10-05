@@ -107,11 +107,29 @@ pub fn localize_key(
         )));
     }
     let ku = password_to_ku(password, protocol);
-    let mut input = ku.as_slice().to_vec();
+    Ok(localize_ku(&ku, engine_id, protocol))
+}
+
+/// RFC 3414 §2.6 step 2: `Kul = H(Ku || engine_id || Ku)` (plain digest, not
+/// HMAC). Shared by the auth KDF and the 3DES chain's second block.
+pub fn localize_ku(ku: &[u8], engine_id: &[u8], protocol: AuthProtocol) -> Zeroizing<Vec<u8>> {
+    let mut input = ku.to_vec();
     input.extend_from_slice(engine_id);
-    input.extend_from_slice(&ku);
-    let digest = hash_digest(&input, protocol);
-    Ok(Zeroizing::new(digest.to_vec()))
+    input.extend_from_slice(ku);
+    Zeroizing::new(plain_digest(&input, protocol))
+}
+
+/// Plain hash digest (the RFC 3414 KDF steps use `H`, not HMAC).
+pub fn plain_digest(data: &[u8], protocol: AuthProtocol) -> Vec<u8> {
+    match protocol {
+        AuthProtocol::Md5 => digest_of::<md5::Md5>(data),
+        AuthProtocol::Sha1 => digest_of::<sha1::Sha1>(data),
+        AuthProtocol::Sha224 => digest_of::<sha2::Sha224>(data),
+        AuthProtocol::Sha256 => digest_of::<sha2::Sha256>(data),
+        AuthProtocol::Sha384 => digest_of::<sha2::Sha384>(data),
+        AuthProtocol::Sha512 => digest_of::<sha2::Sha512>(data),
+        AuthProtocol::None_ => Vec::new(),
+    }
 }
 
 /// The full HMAC digest over `msg` with the localized `key` (usm.py:_compute_auth_tag).

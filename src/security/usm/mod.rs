@@ -3,6 +3,8 @@
 pub mod auth;
 pub mod engine;
 pub mod kdf;
+#[path = "priv.rs"]
+pub mod privacy;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,7 +22,7 @@ use crate::error::{EngineReport, Error, ProtocolError, UnwrapOutcome};
 pub use crate::security::usm::engine::UsmLocalEngine;
 use crate::security::usm::engine::{KeyMaterial, UsmEngineState, advance_local_engine};
 use crate::security::usm::kdf::{
-    AuthProtocol, PrivProtocol, auth_enabled, auth_tag_length, password_to_ku,
+    AuthProtocol, PrivProtocol, auth_enabled, auth_tag_length, password_to_ku, plain_digest,
 };
 use crate::time::{Clock, Rng};
 use crate::transport::dispatcher::RequestDispatcher;
@@ -202,6 +204,8 @@ pub struct UsmModel {
     state: Mutex<UsmEngineState>,
     /// Clock for monotonic engine-time anchors.
     clock: Arc<dyn Clock>,
+    /// RNG for privacy salts (AES salt; CBC salt first-octet tweak).
+    rng: Arc<dyn Rng>,
 }
 
 impl Clone for UsmModel {
@@ -217,18 +221,21 @@ impl Clone for UsmModel {
             local_engine: self.local_engine.clone(),
             state: Mutex::new(state),
             clock: Arc::clone(&self.clock),
+            rng: Arc::clone(&self.rng),
         }
     }
 }
 
 impl UsmModel {
-    /// Creates a model. `clock` anchors engine-time advancement.
+    /// Creates a model. `clock` anchors engine-time advancement; `rng` feeds
+    /// privacy salt generation (§7: AES salt + the CBC salt first-octet tweak).
     #[must_use]
     pub fn new(
         user: UsmUser,
         context_name: Vec<u8>,
         local_engine: Option<UsmLocalEngine>,
         clock: Arc<dyn Clock>,
+        rng: Arc<dyn Rng>,
     ) -> Self {
         Self {
             user,
@@ -236,6 +243,7 @@ impl UsmModel {
             local_engine,
             state: Mutex::new(UsmEngineState::default()),
             clock,
+            rng,
         }
     }
 
@@ -274,11 +282,6 @@ impl UsmModel {
 
     /// Encodes a PDU into an SNMPv3 USM message (usm.py:wrap_pdu).
     pub fn wrap_pdu(&self, pdu: &Pdu) -> Result<Vec<u8>, Error> {
-        if self.user.priv_protocol != PrivProtocol::None_ {
-            return Err(Error::Protocol(ProtocolError::new(
-                "privacy (priv_protocol != none) is not implemented until Phase 4 (priv.rs)",
-            )));
-        }
         let mut state = self
             .state
             .lock()
@@ -289,7 +292,27 @@ impl UsmModel {
         let msg_id = state.next_msg_id();
 
         let scoped = encode_scoped_pdu(&engine.engine_id, &self.context_name, pdu)?;
-        let priv_params = Vec::new();
+        let (msg_data, priv_params) = if self.user.priv_protocol != PrivProtocol::None_ {
+            // Encrypt the ScopedPDU (RFC 3826 / draft-reeder; usm.py priv path).
+            let key = self.priv_key(&engine.engine_id, &mut state)?;
+            let salt = if self.user.priv_protocol == PrivProtocol::Des3Ede {
+                privacy::fresh_cbc_salt(&*self.rng, &mut state.last_cbc_salt_first_octet)
+            } else {
+                privacy::fresh_aes_salt(&*self.rng)
+            };
+            let encrypted = privacy::encrypt_for_protocol(
+                &key,
+                &scoped,
+                engine.engine_boots,
+                engine.engine_time,
+                &salt,
+                self.user.priv_protocol,
+            )?;
+            // msgData is the OCTET STRING wrapping the ciphertext (RFC 3826 §3).
+            (crate::codec::encode_tlv(0x04, &encrypted)?, salt.to_vec())
+        } else {
+            (scoped, Vec::new())
+        };
         let auth_params = if auth_enabled(self.user.auth_protocol) {
             vec![0u8; auth_tag_length(self.user.auth_protocol)]
         } else {
@@ -303,7 +326,7 @@ impl UsmModel {
             auth_params,
             priv_params,
         };
-        let raw = encode_v3_message(i64::from(msg_id), MAX_MSG_SIZE, flags, &usm, &scoped)?;
+        let raw = encode_v3_message(i64::from(msg_id), MAX_MSG_SIZE, flags, &usm, &msg_data)?;
 
         if auth_enabled(self.user.auth_protocol) {
             let key = self.auth_key(&engine.engine_id, &mut state)?;
@@ -354,9 +377,39 @@ impl UsmModel {
             }
         }
         let msg_data = view.msg_data_bytes.clone();
+        let inbound_boots = view.usm_params.engine_boots.max(0) as u32;
+        let inbound_time = view.usm_params.engine_time.max(0) as u32;
         drop(state);
 
-        let pdu = match decode_scoped_pdu(&msg_data) {
+        let plaintext = if self.user.priv_protocol != PrivProtocol::None_ {
+            // Decrypt the inbound encryptedPDU (usm.py:_decrypt_priv). A
+            // missing/malformed OCTET STRING or non-8-octet salt is NotForUs.
+            let key = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match self.priv_key(&view.usm_params.engine_id, &mut state) {
+                    Ok(key) => key,
+                    Err(_) => return UnwrapOutcome::NotForUs,
+                }
+            };
+            match privacy::decrypt_for_protocol(
+                &key,
+                &msg_data,
+                inbound_boots,
+                inbound_time,
+                &view.usm_params.priv_params,
+                self.user.priv_protocol,
+            ) {
+                Ok(plain) => plain,
+                Err(_) => return UnwrapOutcome::NotForUs,
+            }
+        } else {
+            msg_data
+        };
+
+        let pdu = match decode_scoped_pdu(&plaintext) {
             Ok((_engine_id, _context, pdu)) => pdu,
             Err(_) => return UnwrapOutcome::NotForUs,
         };
@@ -560,27 +613,51 @@ impl UsmModel {
             }
         }
     }
-}
 
-/// Plain hash digest (RFC 3414 step 2 uses `H`, not HMAC).
-fn plain_digest(data: &[u8], protocol: AuthProtocol) -> Vec<u8> {
-    match protocol {
-        AuthProtocol::Md5 => digest::<md5::Md5>(data),
-        AuthProtocol::Sha1 => digest::<sha1::Sha1>(data),
-        AuthProtocol::Sha224 => digest::<sha2::Sha224>(data),
-        AuthProtocol::Sha256 => digest::<sha2::Sha256>(data),
-        AuthProtocol::Sha384 => digest::<sha2::Sha384>(data),
-        AuthProtocol::Sha512 => digest::<sha2::Sha512>(data),
-        AuthProtocol::None_ => Vec::new(),
+    /// The localized privacy key for the configured protocol at its full key
+    /// length (usm.py:_priv_key). Passphrases are localized against `engine_id`
+    /// and cached; already-localized keys are adapted (truncate/extend) in place.
+    fn priv_key(
+        &self,
+        engine_id: &[u8],
+        state: &mut UsmEngineState,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let protocol = self.user.priv_protocol;
+        if protocol == PrivProtocol::None_ {
+            return Err(Error::Protocol(ProtocolError::new(
+                "no privacy protocol configured",
+            )));
+        }
+        match &self.user.priv_key {
+            PrivKey::Localized(key) => Ok(privacy::adapt_localized_key(
+                key,
+                protocol,
+                self.user.auth_protocol,
+            )),
+            PrivKey::Passphrase(passphrase) => {
+                if passphrase.is_empty() {
+                    return Err(Error::Protocol(ProtocolError::new(format!(
+                        "{protocol:?} privacy requires a priv_key"
+                    ))));
+                }
+                let cache_key = KeyMaterial::new(&[&[protocol as u8], engine_id, passphrase]);
+                if let Some(cached) = state.priv_key_cache.get(&cache_key) {
+                    return Ok(cached);
+                }
+                let key = privacy::localized_priv_key(
+                    passphrase,
+                    engine_id,
+                    self.user.auth_protocol,
+                    protocol,
+                )?;
+                state.priv_key_cache.set(cache_key, key.clone());
+                Ok(key)
+            }
+        }
     }
 }
 
-fn digest<D: hmac::digest::Digest>(data: &[u8]) -> Vec<u8> {
-    let mut hasher = D::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
-}
-
+/// Plain hash digest (RFC 3414 step 2 uses `H`, not HMAC).
 /// msgFlags per PDU class (usm.py:_msg_flags): reportable only for confirmed
 /// PDUs; traps and responses carry it cleared.
 fn msg_flags(kind: PduKind, auth: AuthProtocol, priv_protocol: PrivProtocol) -> u8 {
@@ -643,6 +720,38 @@ mod tests {
         Arc::new(crate::time::SystemClock)
     }
 
+    fn rng() -> Arc<dyn Rng> {
+        Arc::new(crate::time::SystemRng)
+    }
+
+    fn priv_user(
+        username: &str,
+        auth: AuthProtocol,
+        priv_protocol: PrivProtocol,
+        priv_passphrase: &[u8],
+    ) -> UsmUser {
+        UsmUser::new(
+            username.to_string(),
+            auth,
+            user(username, auth).auth_key,
+            priv_protocol,
+            PrivKey::Passphrase(priv_passphrase.to_vec()),
+        )
+        .unwrap()
+    }
+
+    fn priv_discovered(auth: AuthProtocol, priv_protocol: PrivProtocol) -> UsmModel {
+        let model = UsmModel::new(
+            priv_user("simulator", auth, priv_protocol, b"privpassword"),
+            Vec::new(),
+            None,
+            clock(),
+            rng(),
+        );
+        model.adopt_engine_state(engine_id(), 2, 500);
+        model
+    }
+
     fn user_with_key(username: &str, auth: AuthProtocol, auth_key: AuthKey) -> UsmUser {
         UsmUser::new(
             username.to_string(),
@@ -691,11 +800,11 @@ mod tests {
     }
 
     fn fresh_with(auth: AuthProtocol) -> UsmModel {
-        UsmModel::new(user("simulator", auth), Vec::new(), None, clock())
+        UsmModel::new(user("simulator", auth), Vec::new(), None, clock(), rng())
     }
 
     fn discovered_with(auth: AuthProtocol) -> UsmModel {
-        let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock());
+        let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock(), rng());
         model.adopt_engine_state(engine_id(), 2, 500);
         model
     }
@@ -721,7 +830,7 @@ mod tests {
             AuthProtocol::Sha384,
             AuthProtocol::Sha512,
         ] {
-            let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock());
+            let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock(), rng());
             model.adopt_engine_state(engine_id(), 2, 500);
             let raw = model.wrap_pdu(&get_pdu()).unwrap();
             let view = decode_v3_message(&raw).unwrap();
@@ -747,6 +856,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         other.adopt_engine_state(engine_id(), 2, 500);
         let raw = other.wrap_pdu(&get_pdu()).unwrap();
@@ -761,6 +871,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         other.adopt_engine_state(vec![0x99; 11], 2, 500);
         let raw = other.wrap_pdu(&get_pdu()).unwrap();
@@ -790,6 +901,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         model.adopt_engine_state(engine_id(), 2, 500);
         let raw = model.wrap_pdu(&get_pdu()).unwrap();
@@ -848,6 +960,7 @@ mod tests {
             Vec::new(),
             Some(local),
             clock(),
+            rng(),
         );
         model.adopt_engine_state(engine_id(), 2, 500);
         let trap = Pdu {
@@ -876,7 +989,7 @@ mod tests {
             PrivKey::Passphrase(Vec::new()),
         )
         .unwrap();
-        let model = UsmModel::new(pw_user, Vec::new(), None, clock());
+        let model = UsmModel::new(pw_user, Vec::new(), None, clock(), rng());
         let engine = engine_id();
         model.adopt_engine_state(engine.clone(), 2, 500);
         let raw = model.wrap_pdu(&get_pdu()).unwrap();
@@ -925,6 +1038,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         sha224.adopt_engine_state(engine_id(), 2, 500);
         let a = sha256.wrap_pdu(&get_pdu()).unwrap();
@@ -942,6 +1056,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         model224.adopt_engine_state(engine_id(), 2, 500);
         let raw = model256.wrap_pdu(&get_pdu()).unwrap();
@@ -965,6 +1080,7 @@ mod tests {
             Vec::new(),
             None,
             clock(),
+            rng(),
         );
         other_key.adopt_engine_state(engine_id(), 2, 500);
         let raw = model.wrap_pdu(&get_pdu()).unwrap();
@@ -1105,5 +1221,216 @@ mod tests {
             .parse_discovery_response(&[0x00, 0x01, 0x02])
             .unwrap_err();
         assert!(err.to_string().contains("invalid response"), "{err}");
+    }
+
+    // ── Phase 4: privacy (← test_v3_crypto_parity.py priv matrix) ──────────
+
+    #[test]
+    fn aes_priv_roundtrips_for_each_key_length() {
+        for (priv_protocol, key_length) in [
+            (PrivProtocol::Aes128, 16),
+            (PrivProtocol::Aes192, 24),
+            (PrivProtocol::Aes256, 32),
+        ] {
+            let model = priv_discovered(AuthProtocol::Sha256, priv_protocol);
+            let raw = model.wrap_pdu(&get_pdu()).unwrap();
+            let outcome = model.unwrap_message(&raw);
+            match outcome {
+                UnwrapOutcome::Ok(pdu) => assert_eq!(pdu.request_id, 7),
+                other => panic!("{priv_protocol:?}: expected Ok, got {other:?}"),
+            }
+            let view = decode_v3_message(&raw).unwrap();
+            assert_eq!(
+                view.msg_flags & MSG_FLAG_PRIV,
+                MSG_FLAG_PRIV,
+                "priv flag set"
+            );
+            assert_eq!(view.usm_params.priv_params.len(), 8, "8-octet salt");
+            assert_eq!(
+                crate::security::usm::privacy::priv_key_length(priv_protocol).unwrap(),
+                key_length
+            );
+        }
+    }
+
+    #[test]
+    fn aes_priv_key_differs_across_engine_password_and_protocol() {
+        let aes128 = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes128);
+        let aes256 = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
+        let mut state = UsmEngineState::default();
+        let k128 = aes128.priv_key(&engine_id(), &mut state).unwrap();
+        let k256 = aes256.priv_key(&engine_id(), &mut state).unwrap();
+        assert_ne!(
+            k128.as_slice(),
+            k256.as_slice(),
+            "AES-256 differs from AES-128"
+        );
+
+        let other_engine = aes256.priv_key(&[0x99; 11], &mut state).unwrap();
+        assert_ne!(
+            other_engine.as_slice(),
+            k256.as_slice(),
+            "differs across engines"
+        );
+
+        // rebuild with a different passphrase
+        let different = UsmModel::new(
+            priv_user(
+                "simulator",
+                AuthProtocol::Sha256,
+                PrivProtocol::Aes256,
+                b"other",
+            ),
+            Vec::new(),
+            None,
+            clock(),
+            rng(),
+        );
+        different.adopt_engine_state(engine_id(), 2, 500);
+        let k_other = different.priv_key(&engine_id(), &mut state).unwrap();
+        assert_ne!(
+            k_other.as_slice(),
+            k256.as_slice(),
+            "differs across passwords"
+        );
+    }
+
+    #[test]
+    fn aes256_message_fails_to_unwrap_under_aes128() {
+        let aes256 = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
+        let aes128 = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes128);
+        let raw = aes256.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(aes128.unwrap_message(&raw), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn priv_key_mismatch_fails_to_decode() {
+        let sender = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
+        let receiver = UsmModel::new(
+            priv_user(
+                "simulator",
+                AuthProtocol::Sha256,
+                PrivProtocol::Aes256,
+                b"wrong",
+            ),
+            Vec::new(),
+            None,
+            clock(),
+            rng(),
+        );
+        receiver.adopt_engine_state(engine_id(), 2, 500);
+        let raw = sender.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(receiver.unwrap_message(&raw), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn tripledes_roundtrip_and_key_layout() {
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Des3Ede);
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        match model.unwrap_message(&raw) {
+            UnwrapOutcome::Ok(pdu) => assert_eq!(pdu.request_id, 7),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let view = decode_v3_message(&raw).unwrap();
+        assert_eq!(view.usm_params.priv_params.len(), 8);
+        // Key layout: first 24 octets 3DES key, last 8 pre-IV (usm.py:846–856).
+        let mut state = UsmEngineState::default();
+        let material = model.priv_key(&engine_id(), &mut state).unwrap();
+        assert_eq!(material.len(), 32);
+    }
+
+    #[test]
+    fn tripledes_short_digest_chain_structure() {
+        // SHA-224: 28-octet digest, so truncation to 32 keeps all of K1 and
+        // the first 4 octets of K2 (test_v3_crypto_parity.py:430).
+        let model = priv_discovered(AuthProtocol::Sha224, PrivProtocol::Des3Ede);
+        let mut state = UsmEngineState::default();
+        let key = model.priv_key(&engine_id(), &mut state).unwrap();
+        let kul = localize_key(b"privpassword", &engine_id(), AuthProtocol::Sha224).unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(&key[..28], kul.as_slice(), "K1 survives truncation");
+    }
+
+    #[test]
+    fn tripledes_digest_at_least_32_uses_plain_localization() {
+        let model = priv_discovered(AuthProtocol::Sha384, PrivProtocol::Des3Ede);
+        let mut state = UsmEngineState::default();
+        let key = model.priv_key(&engine_id(), &mut state).unwrap();
+        let kul = localize_key(b"privpassword", &engine_id(), AuthProtocol::Sha384).unwrap();
+        assert_eq!(
+            key.as_slice(),
+            &kul[..32],
+            "digest >= 32 uses plain localization"
+        );
+    }
+
+    #[test]
+    fn tripledes_salt_first_octet_changes_between_messages() {
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Des3Ede);
+        let mut salts = Vec::new();
+        for _ in 0..4 {
+            let raw = model.wrap_pdu(&get_pdu()).unwrap();
+            let view = decode_v3_message(&raw).unwrap();
+            salts.push(view.usm_params.priv_params.clone());
+        }
+        for pair in salts.windows(2) {
+            assert_ne!(pair[0][0], pair[1][0], "CBC salt first octet changes");
+        }
+    }
+
+    #[test]
+    fn tripledes_each_wrap_uses_fresh_salt() {
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Des3Ede);
+        let raw1 = model.wrap_pdu(&get_pdu()).unwrap();
+        let raw2 = model.wrap_pdu(&get_pdu()).unwrap();
+        assert_ne!(raw1, raw2);
+        let v1 = decode_v3_message(&raw1).unwrap();
+        let v2 = decode_v3_message(&raw2).unwrap();
+        assert_ne!(v1.usm_params.priv_params, v2.usm_params.priv_params);
+    }
+
+    #[test]
+    fn tripledes_rejects_priv_params_longer_than_8() {
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Des3Ede);
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        let view = decode_v3_message(&raw).unwrap();
+        let p = &view.usm_params;
+        let padded_usm = crate::codec::v3::UsmSecurityParameters {
+            engine_id: p.engine_id.clone(),
+            engine_boots: p.engine_boots,
+            engine_time: p.engine_time,
+            username: p.username.clone(),
+            auth_params: vec![0u8; 12],
+            priv_params: [p.priv_params.as_slice(), &[0u8]].concat(),
+        };
+        let scoped = view.msg_data_bytes.clone();
+        let reencoded = crate::codec::v3::encode_v3_message(
+            view.msg_id,
+            65507,
+            view.msg_flags,
+            &padded_usm,
+            &scoped,
+        )
+        .unwrap();
+        let restamped = crate::security::usm::auth::stamp_auth(
+            &reencoded,
+            &model
+                .auth_key(&engine_id(), &mut UsmEngineState::default())
+                .unwrap(),
+            AuthProtocol::Sha256,
+        )
+        .unwrap();
+        assert_eq!(model.unwrap_message(&restamped), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn priv_key_cache_invalidated_on_boots_change() {
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
+        let mut state = UsmEngineState::default();
+        let k1 = model.priv_key(&engine_id(), &mut state).unwrap();
+        // A reboot (boots change) clears the localized caches.
+        state.adopt_engine_state(engine_id(), 3, 100, Duration::from_secs(0));
+        let k2 = model.priv_key(&engine_id(), &mut state).unwrap();
+        assert_eq!(k1.as_slice(), k2.as_slice(), "derivation is deterministic");
     }
 }

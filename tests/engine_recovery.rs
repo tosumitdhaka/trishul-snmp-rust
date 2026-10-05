@@ -59,6 +59,7 @@ fn discovered_model(username: &str) -> UsmModel {
         Vec::new(),
         None,
         Arc::new(trishul_snmp::time::SystemClock),
+        Arc::new(common::fake::CounterRng::new(7)),
     );
     model.adopt_engine_state(ENGINE_ID.to_vec(), 2, 100);
     model
