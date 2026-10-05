@@ -8,6 +8,11 @@ use tokio::net::UdpSocket;
 
 use trishul_snmp::codec::message::{SnmpMessage, decode_message, encode_message};
 use trishul_snmp::codec::pdu::{Pdu, PduKind};
+use trishul_snmp::codec::v3::{
+    UsmSecurityParameters, decode_v3_message, encode_scoped_pdu, encode_v3_message,
+};
+use trishul_snmp::error::UnwrapOutcome;
+use trishul_snmp::security::usm::UsmModel;
 use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::VarBind;
@@ -57,6 +62,19 @@ impl AgentReply {
 /// produce the reply.
 pub type AgentLogic = Arc<dyn Fn(&Oid, PduKind) -> AgentReply + Send + Sync>;
 
+/// v3-side agent identity: the reply UsmModel (peer = the agent's own engine)
+/// plus the authoritative engine parameters used for discovery REPORTs.
+pub struct AgentUsm {
+    /// The reply model; its peer state is the agent's own engine.
+    pub model: Arc<UsmModel>,
+    /// Authoritative engine id.
+    pub engine_id: Vec<u8>,
+    /// Authoritative engine boots.
+    pub engine_boots: u32,
+    /// Authoritative engine time.
+    pub engine_time: u32,
+}
+
 /// A loopback UDP fake agent.
 ///
 /// Decodes inbound messages, records what was requested, computes a reply via
@@ -79,6 +97,18 @@ impl FakeAgent {
     /// Spawns an agent on an ephemeral loopback port. Returns the agent and
     /// the port to point clients at.
     pub async fn spawn(logic: AgentLogic) -> (Arc<FakeAgent>, u16) {
+        Self::spawn_with(logic, None).await
+    }
+
+    /// Spawns a v3-capable agent: answers RFC 3414 discovery probes with a
+    /// noAuth REPORT carrying `usm`'s authoritative engine parameters, verifies
+    /// inbound auth via `usm.model`, and replies with model-wrapped RESPONSEs.
+    pub async fn spawn_v3(logic: AgentLogic, usm: AgentUsm) -> (Arc<FakeAgent>, u16) {
+        Self::spawn_with(logic, Some(usm)).await
+    }
+
+    /// The shared spawn path.
+    async fn spawn_with(logic: AgentLogic, usm: Option<AgentUsm>) -> (Arc<FakeAgent>, u16) {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback"));
         let port = socket.local_addr().expect("bound").port();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -98,6 +128,7 @@ impl FakeAgent {
         });
         let task_socket = Arc::clone(&socket);
         let task_logic = logic;
+        let task_usm: Option<AgentUsm> = usm;
         let task_oids = Arc::clone(&requested_oids);
         let task_kinds = Arc::clone(&requested_kinds);
         let task_max_rep = Arc::clone(&requested_max_repetitions);
@@ -146,6 +177,20 @@ impl FakeAgent {
                             if let Ok(bytes) = encode_message(&response) {
                                 let _ = task_socket.send_to(&bytes, peer).await;
                             }
+                        } else if let Some(agent_usm) = &task_usm {
+                            handle_v3_datagram(
+                                &data,
+                                agent_usm,
+                                &task_logic,
+                                &AgentRecords {
+                                    oids: &task_oids,
+                                    kinds: &task_kinds,
+                                    max_repetitions: &task_max_rep,
+                                },
+                                &task_socket,
+                                peer,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -316,4 +361,135 @@ pub async fn silent_agent() -> (Arc<FakeAgent>, u16) {
         }
     });
     (agent, port)
+}
+
+/// Shared record buffers for the v3 reply path.
+struct AgentRecords<'a> {
+    oids: &'a Arc<Mutex<Vec<Oid>>>,
+    kinds: &'a Arc<Mutex<Vec<PduKind>>>,
+    max_repetitions: &'a Arc<Mutex<Vec<i32>>>,
+}
+
+/// Handles one v3 datagram: discovery probes get a noAuth REPORT; authed
+/// requests are verified and answered with a model-wrapped RESPONSE.
+async fn handle_v3_datagram(
+    data: &[u8],
+    agent_usm: &AgentUsm,
+    logic: &AgentLogic,
+    records: &AgentRecords<'_>,
+    socket: &Arc<UdpSocket>,
+    peer: std::net::SocketAddr,
+) {
+    let view = match decode_v3_message(data) {
+        Ok(view) => view,
+        Err(_) => return,
+    };
+    if view.usm_params.engine_id.is_empty() {
+        // RFC 3414 discovery probe: reply with a noAuth REPORT carrying our
+        // authoritative engine parameters.
+        let report = discovery_report(view.msg_id, agent_usm);
+        if let Ok(bytes) = report {
+            let _ = socket.send_to(&bytes, peer).await;
+        }
+        return;
+    }
+    if let UnwrapOutcome::Ok(pdu) = agent_usm.model.unwrap_message(data) {
+        let requested = pdu
+            .varbinds
+            .first()
+            .map(|v| v.oid.clone())
+            .unwrap_or_else(|| oid(&[0, 0]));
+        records.oids.lock().unwrap().push(requested.clone());
+        records.kinds.lock().unwrap().push(pdu.kind);
+        records
+            .max_repetitions
+            .lock()
+            .unwrap()
+            .push(pdu.error_index);
+        let reply = (logic)(&requested, pdu.kind);
+        let response = Pdu {
+            kind: PduKind::Response,
+            request_id: pdu.request_id,
+            error_status: reply.error_status,
+            error_index: reply.error_index,
+            varbinds: reply.varbinds,
+            v1_trap: None,
+        };
+        if let Ok(bytes) = agent_usm.model.wrap_pdu(&response) {
+            let _ = socket.send_to(&bytes, peer).await;
+        }
+    }
+}
+
+/// Builds a noAuth discovery REPORT carrying the agent's engine parameters.
+fn discovery_report(msg_id: i64, agent_usm: &AgentUsm) -> Result<Vec<u8>, String> {
+    let report = Pdu {
+        kind: PduKind::Report,
+        request_id: 1,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![vb(
+            &[1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0],
+            SnmpValue::Counter32(1),
+        )],
+        v1_trap: None,
+    };
+    let scoped =
+        encode_scoped_pdu(&agent_usm.engine_id, b"", &report).map_err(|e| e.to_string())?;
+    let usm = UsmSecurityParameters {
+        engine_id: agent_usm.engine_id.clone(),
+        engine_boots: i64::from(agent_usm.engine_boots),
+        engine_time: i64::from(agent_usm.engine_time),
+        username: Vec::new(),
+        auth_params: Vec::new(),
+        priv_params: Vec::new(),
+    };
+    encode_v3_message(msg_id, 65507, 0, &usm, &scoped).map_err(|e| e.to_string())
+}
+
+/// Builds a noAuth `usmStatsNotInTimeWindows` REPORT datagram — the
+/// engine-recovery test helper (← test_engine_recovery.py:_build_report_bytes).
+pub fn build_recovery_report(
+    engine_id: &[u8],
+    engine_boots: u32,
+    engine_time: u32,
+    username: &[u8],
+) -> Vec<u8> {
+    let report = Pdu {
+        kind: PduKind::Report,
+        request_id: 1,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![vb(
+            &[1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0],
+            SnmpValue::Counter32(1),
+        )],
+        v1_trap: None,
+    };
+    let scoped = encode_scoped_pdu(engine_id, b"", &report).expect("scoped pdu encodes");
+    let usm = UsmSecurityParameters {
+        engine_id: engine_id.to_vec(),
+        engine_boots: i64::from(engine_boots),
+        engine_time: i64::from(engine_time),
+        username: username.to_vec(),
+        auth_params: Vec::new(),
+        priv_params: Vec::new(),
+    };
+    encode_v3_message(1, 65507, 0, &usm, &scoped).expect("report encodes")
+}
+
+/// Builds an agent-side UsmModel with its own engine adopted as peer state —
+/// the model used to wrap RESPONSEs and verify inbound auth
+/// (engine-recovery / v3 client tests).
+pub fn usm_agent_model(
+    user: trishul_snmp::security::usm::UsmUser,
+    engine_id: Vec<u8>,
+    engine_boots: u32,
+    engine_time: u32,
+) -> UsmModel {
+    use std::sync::Arc;
+    use trishul_snmp::time::SystemClock;
+    let model = UsmModel::new(user, Vec::new(), None, Arc::new(SystemClock));
+    model.adopt_engine_state(engine_id, engine_boots, engine_time);
+    model
 }

@@ -59,6 +59,13 @@ pub(crate) fn decode_length(data: &[u8], offset: usize) -> Result<(usize, usize)
 
 /// Decodes a BER TLV (single-octet tag), returning `(tag, content, end)`
 /// (← ber.py:36–50).
+pub(crate) fn encode_tlv(tag: u8, content: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut tlv = vec![tag];
+    tlv.extend(encode_length(content.len())?);
+    tlv.extend_from_slice(content);
+    Ok(tlv)
+}
+
 pub(crate) fn decode_tlv(data: &[u8], offset: usize) -> Result<(u8, &[u8], usize), ProtocolError> {
     if offset >= data.len() {
         return Err(ProtocolError::new("BER tag is truncated"));

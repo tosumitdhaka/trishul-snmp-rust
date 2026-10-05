@@ -14,11 +14,15 @@ use std::net::Ipv4Addr;
 use proptest::prelude::*;
 
 use trishul_snmp::codec::message::decode_message;
-use trishul_snmp::codec::pdu::decode_pdu;
-use trishul_snmp::codec::v3::locate_auth_params;
+use trishul_snmp::codec::pdu::{Pdu, PduKind, decode_pdu};
+use trishul_snmp::codec::v3::{
+    UsmSecurityParameters, decode_v3_message, encode_scoped_pdu, encode_v3_message,
+    locate_auth_params,
+};
 use trishul_snmp::codec::{decode_value, encode_value};
 use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
+use trishul_snmp::types::varbind::VarBind;
 
 fn oid_strategy() -> impl Strategy<Value = Oid> {
     (
@@ -176,6 +180,73 @@ proptest! {
 }
 
 // ── boundary-length inputs (test_wire_fuzz.py, deterministic) ───────────────
+
+fn v3_usm_params() -> UsmSecurityParameters {
+    UsmSecurityParameters {
+        engine_id: vec![
+            0x80, 0x00, 0x1f, 0x88, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        engine_boots: 1,
+        engine_time: 500,
+        username: b"property-user".to_vec(),
+        auth_params: vec![0u8; 12],
+        priv_params: Vec::new(),
+    }
+}
+
+fn v3_pdu(request_id: u32) -> Pdu {
+    Pdu {
+        kind: PduKind::GetRequest,
+        request_id,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![VarBind::new(
+            trishul_snmp::types::oid::Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap(),
+            SnmpValue::Null,
+        )],
+        v1_trap: None,
+    }
+}
+
+proptest! {
+    /// Risk #2 mitigation: `locate_auth_params` must agree with the full
+    /// decoder's `auth_params_offset` on every generated v3 message.
+    #[test]
+    fn locate_auth_params_agrees_with_decoder(
+        msg_id in 0i64..1 << 30,
+        max_size in 484i64..65507,
+        request_id in 0u32..1 << 31,
+        context_len in 0usize..16,
+    ) {
+        let mut usm = v3_usm_params();
+        usm.engine_boots = 1;
+        usm.engine_time = (request_id % 1000) as i64;
+        let context = vec![0x61u8; context_len];
+        let scoped = encode_scoped_pdu(&usm.engine_id, &context, &v3_pdu(request_id)).unwrap();
+        let raw = encode_v3_message(
+            msg_id,
+            max_size,
+            0x05, // auth + reportable
+            &usm,
+            &scoped,
+        )
+        .unwrap();
+        prop_assert_eq!(
+            locate_auth_params(&raw).unwrap(),
+            decode_v3_message(&raw).unwrap().auth_params_offset
+        );
+        // And the offset really points at the auth_params content.
+        let offset = locate_auth_params(&raw).unwrap();
+        prop_assert_eq!(&raw[offset..offset + 12], &[0u8; 12]);
+    }
+
+    /// Decoding generated v3 messages never panics.
+    #[test]
+    fn decode_v3_message_never_panics(data in prop::collection::vec(any::<u8>(), 0..2048)) {
+        let _ = decode_v3_message(&data);
+        let _ = locate_auth_params(&data);
+    }
+}
 
 #[test]
 fn decode_message_rejects_empty_payload() {

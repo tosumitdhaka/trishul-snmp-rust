@@ -13,6 +13,9 @@ pub enum SnmpVersion {
     V1,
     /// SNMPv2c.
     V2c,
+    /// SNMPv3 — used as the client flavor tag; v3 messages never flow
+    /// through `SnmpMessage` (the v3 envelope is `codec::v3`).
+    V3,
 }
 
 impl SnmpVersion {
@@ -22,6 +25,9 @@ impl SnmpVersion {
         match self {
             Self::V1 => 0,
             Self::V2c => 1,
+            // v3 messages use the codec::v3 envelope; to_wire is never
+            // reached for V3 (SnmpMessage.encode rejects it defensively).
+            Self::V3 => 3,
         }
     }
 }

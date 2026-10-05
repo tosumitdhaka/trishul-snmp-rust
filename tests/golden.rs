@@ -393,34 +393,88 @@ fn build(name: &str) -> SnmpMessage {
     }
 }
 
+/// Reconstructs a v3 golden message: `(encoded bytes, expected decode view)`.
+/// `v3-authnopriv-get-md5` localizes "maplesyrup" (RFC 3414 A.2) and stamps
+/// the HMAC-MD5 tag — the same KDF the golden fixture was generated with.
+fn build_v3(name: &str) -> (Vec<u8>, trishul_snmp::codec::v3::V3Message) {
+    use trishul_snmp::codec::v3::{UsmSecurityParameters, encode_scoped_pdu, encode_v3_message};
+    use trishul_snmp::security::usm::auth;
+    use trishul_snmp::security::usm::kdf::{AuthProtocol, auth_tag_length, localize_key};
+
+    let engine_id = hex("000000000000000000000002");
+    let sys_uptime = [1, 3, 6, 1, 2, 1, 1, 3, 0];
+    let request_id = if name == "v3-authnopriv-get-md5" {
+        1202
+    } else {
+        1201
+    };
+    let pdu = pdu(
+        PduKind::GetRequest,
+        request_id,
+        0,
+        0,
+        vec![vb(&sys_uptime, SnmpValue::Null)],
+    );
+    let scoped = encode_scoped_pdu(&engine_id, b"", &pdu).unwrap();
+    let auth = name == "v3-authnopriv-get-md5";
+    let usm = UsmSecurityParameters {
+        engine_id: engine_id.clone(),
+        engine_boots: 1,
+        engine_time: 500,
+        username: b"golden".to_vec(),
+        auth_params: if auth {
+            vec![0u8; auth_tag_length(AuthProtocol::Md5)]
+        } else {
+            Vec::new()
+        },
+        priv_params: Vec::new(),
+    };
+    let flags = if auth { 0x05 } else { 0x04 };
+    let raw = encode_v3_message(1, 65507, flags, &usm, &scoped).unwrap();
+    let raw = if auth {
+        let key = localize_key(b"maplesyrup", &engine_id, AuthProtocol::Md5).unwrap();
+        auth::stamp_auth(&raw, &key, AuthProtocol::Md5).unwrap()
+    } else {
+        raw
+    };
+    let view = trishul_snmp::codec::v3::decode_v3_message(&raw).unwrap();
+    (raw, view)
+}
+
 #[test]
 fn golden_encode_and_decode_parity() {
     let value: Value = serde_json::from_str(GOLDEN).expect("golden.json parses");
     let cases = value["cases"].as_array().expect("cases is an array");
     let mut consumed = 0;
-    let mut skipped = 0;
     for case in cases {
         let name = case["name"].as_str().unwrap();
-        if name.starts_with("v3-") {
-            skipped += 1;
-            continue;
-        }
         let expected = hex(case["hex"].as_str().unwrap());
-        let message = build(name);
+        if name.starts_with("v3-") {
+            // The v3 goldens carry an SNMPv3 envelope; compare via the v3
+            // codec. `build_v3` returns (our encode, expected decode view).
+            let (encoded, view) = build_v3(name);
+            assert_eq!(
+                encoded, expected,
+                "{name}: encoded bytes differ from golden"
+            );
+            let decoded = trishul_snmp::codec::v3::decode_v3_message(&expected)
+                .unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+            assert_eq!(decoded, view, "{name}: decoded structure differs");
+        } else {
+            let message = build(name);
 
-        let encoded =
-            encode_message(&message).unwrap_or_else(|e| panic!("{name}: encode failed: {e}"));
-        assert_eq!(
-            encoded, expected,
-            "{name}: encoded bytes differ from golden"
-        );
+            let encoded =
+                encode_message(&message).unwrap_or_else(|e| panic!("{name}: encode failed: {e}"));
+            assert_eq!(
+                encoded, expected,
+                "{name}: encoded bytes differ from golden"
+            );
 
-        let decoded =
-            decode_message(&expected).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
-        assert_eq!(decoded, message, "{name}: decoded structure differs");
-
+            let decoded =
+                decode_message(&expected).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+            assert_eq!(decoded, message, "{name}: decoded structure differs");
+        }
         consumed += 1;
     }
-    assert_eq!(consumed, 26, "expected 26 non-v3 golden cases");
-    assert_eq!(skipped, 2, "expected 2 v3 golden cases to be skipped");
+    assert_eq!(consumed, 28, "expected 28 golden cases (26 v1/v2c + 2 v3)");
 }

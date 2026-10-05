@@ -57,6 +57,7 @@ impl Manager {
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
+            skip_prepare: false,
         })
         .await?;
         Ok(Self { session, version })
@@ -189,15 +190,74 @@ impl Manager {
         {
             Ok(pdu) => pdu,
             Err(Error::EngineRecovery(_)) => {
-                // Adopt the recovery report and retry once.
-                self.session
+                // The dispatcher already consumed the recovery report (it is
+                // carried in the error); the model adopted the peer's state,
+                // so retry exactly once (client.py:150–169). A second REPORT
+                // on the retry propagates — one retry, no loop.
+                match self
+                    .session
                     .dispatcher
                     .send_pdu(kind, varbinds, error_status, error_index)
-                    .await?
+                    .await
+                {
+                    Ok(pdu) => pdu,
+                    Err(Error::EngineRecovery(report)) => {
+                        // Clear any residual flag so a later stray datagram
+                        // cannot trigger a spurious recovery (client.py:165–169).
+                        let _ = self.session.security.take_recovery();
+                        return Err(Error::EngineRecovery(report));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(timeout @ Error::Timeout { .. }) => {
+                // Risk #14: the reference catches RequestTimeoutError too and
+                // consults the recovery flag before deciding whether to retry.
+                // In the typed flow the dispatcher consumes recoveries
+                // immediately, so this check is normally empty — but a REPORT
+                // adopted just before the deadline expired must still retry
+                // once rather than mis-report a timeout.
+                if self.session.security.take_recovery().is_none() {
+                    return Err(timeout);
+                }
+                match self
+                    .session
+                    .dispatcher
+                    .send_pdu(kind, varbinds, error_status, error_index)
+                    .await
+                {
+                    Ok(pdu) => pdu,
+                    Err(other) => return Err(other),
+                }
             }
             Err(other) => return Err(other),
         };
         response_from_pdu(pdu)
+    }
+
+    /// Connects a v3 manager (RFC 3414 discovery runs during connect).
+    pub async fn connect_v3(config: crate::security::usm::V3Config) -> Result<Self, Error> {
+        let model = crate::security::usm::UsmModel::new(
+            config.user,
+            config.context_name,
+            config.local_engine,
+            Arc::clone(&config.clock),
+        );
+        let security = Arc::new(SecurityModel::Usm(model));
+        let session = SnmpSession::connect(SessionConfig {
+            host: config.host,
+            port: config.port,
+            security,
+            timeout: config.timeout,
+            retries: config.retries,
+            rng: config.rng,
+            skip_prepare: false,
+        })
+        .await?;
+        Ok(Self {
+            session,
+            version: SnmpVersion::V3,
+        })
     }
 }
 

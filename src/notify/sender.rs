@@ -88,6 +88,7 @@ impl Notifier {
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
+            skip_prepare: false,
         })
         .await?;
         Ok(Self { session, version })
@@ -101,6 +102,33 @@ impl Notifier {
     /// Connects a v2c notifier.
     pub async fn connect_v2c(config: V2cNotifierConfig) -> Result<Self, Error> {
         Self::connect_community(config, SnmpVersion::V2c).await
+    }
+
+    /// Connects a v3 notifier. Peer discovery runs during connect unless a
+    /// `local_engine` is present (trap-only workflow skips eager discovery,
+    /// notify/client.py:open); `send_inform` discovers lazily either way.
+    pub async fn connect_v3(config: crate::security::usm::V3Config) -> Result<Self, Error> {
+        let model = crate::security::usm::UsmModel::new(
+            config.user,
+            config.context_name,
+            config.local_engine.clone(),
+            Arc::clone(&config.clock),
+        );
+        let security = Arc::new(SecurityModel::Usm(model));
+        let session = SnmpSession::connect(SessionConfig {
+            host: config.host,
+            port: config.port,
+            security,
+            timeout: config.timeout,
+            retries: config.retries,
+            rng: config.rng,
+            skip_prepare: config.local_engine.is_some(),
+        })
+        .await?;
+        Ok(Self {
+            session,
+            version: SnmpVersion::V3,
+        })
     }
 
     /// Sends a v2c SNMPv2-TRAP and returns the request id
@@ -184,15 +212,37 @@ impl Notifier {
         let built = build_notification_varbinds(&notification_oid, varbinds, uptime)?;
 
         let _guard = self.session.request_lock.lock().await;
+        // v3: discover peer engine state lazily on first use
+        // (notify/client.py:300–303).
+        if let SecurityModel::Usm(model) = &*self.session.security
+            && !model.peer_engine_discovered()
+        {
+            model.prepare(&self.session.dispatcher).await?;
+        }
         let request =
             self.session
                 .dispatcher
-                .prepare_request(PduKind::InformRequest, built, 0, 0)?;
-        let pdu = self
-            .session
-            .dispatcher
-            .send_prepared_request(request)
-            .await?;
+                .prepare_request(PduKind::InformRequest, built.clone(), 0, 0)?;
+        let pdu = match self.session.dispatcher.send_prepared_request(request).await {
+            Ok(pdu) => pdu,
+            Err(Error::EngineRecovery(_)) => {
+                // The model adopted the peer's authoritative state from the
+                // REPORT; re-issue the inform once (notify/client.py:307–322).
+                let request =
+                    self.session
+                        .dispatcher
+                        .prepare_request(PduKind::InformRequest, built, 0, 0)?;
+                match self.session.dispatcher.send_prepared_request(request).await {
+                    Ok(pdu) => pdu,
+                    Err(Error::EngineRecovery(report)) => {
+                        let _ = self.session.security.take_recovery();
+                        return Err(Error::EngineRecovery(report));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(other) => return Err(other),
+        };
         response_from_pdu(pdu)
     }
 }

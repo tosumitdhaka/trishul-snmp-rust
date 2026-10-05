@@ -1,1 +1,889 @@
-//! UsmModel facade: wrap/unwrap/prepare (← usm.py)
+//! UsmModel facade: wrap/unwrap/prepare, recovery (← usm.py)
+
+pub mod auth;
+pub mod engine;
+pub mod kdf;
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use zeroize::Zeroizing;
+
+use crate::codec::message::SnmpVersion;
+use crate::codec::pdu::{Pdu, PduKind};
+use crate::codec::v3::{
+    MSG_FLAG_AUTH, MSG_FLAG_PRIV, MSG_FLAG_REPORTABLE, UsmSecurityParameters, decode_scoped_pdu,
+    decode_v3_message, encode_scoped_pdu, encode_v3_message,
+};
+use crate::error::{EngineReport, Error, ProtocolError, UnwrapOutcome};
+pub use crate::security::usm::engine::UsmLocalEngine;
+use crate::security::usm::engine::{UsmEngineState, advance_local_engine};
+use crate::security::usm::kdf::{
+    AuthProtocol, PrivProtocol, auth_enabled, auth_tag_length, password_to_ku,
+};
+use crate::time::{Clock, Rng};
+use crate::transport::dispatcher::RequestDispatcher;
+use crate::types::oid::Oid;
+use crate::types::value::SnmpValue;
+use crate::types::varbind::VarBind;
+
+/// Maximum message size declared by this implementation's sends.
+const MAX_MSG_SIZE: i64 = 65507;
+/// usmStatsNotInTimeWindows.0 (RFC 3414 §5.2.3).
+const NOT_IN_TIME_WINDOWS_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0];
+/// usmStatsUnknownUserNames.0 — the discovery probe target.
+const UNKNOWN_USER_NAMES_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0];
+
+/// An auth key: either a passphrase to localize (RFC 3414 §2.6) or an
+/// already-localized key of exactly the protocol's digest length
+/// (usm.py:UsmUser.auth_key + auth_key_localized).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthKey {
+    /// Passphrase; localized at message time (cached per engine).
+    Passphrase(Vec<u8>),
+    /// Already-localized key bytes.
+    Localized(Zeroizing<Vec<u8>>),
+}
+
+/// A privacy key: passphrase or already-localized bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivKey {
+    /// Passphrase; localized at message time.
+    Passphrase(Vec<u8>),
+    /// Already-localized key bytes.
+    Localized(Zeroizing<Vec<u8>>),
+}
+
+/// Construction-validated USM credentials (usm.py:UsmUser; §5.4).
+#[derive(Clone, Debug)]
+pub struct UsmUser {
+    /// User name.
+    pub username: String,
+    /// Authentication protocol.
+    pub auth_protocol: AuthProtocol,
+    /// Authentication key material.
+    pub auth_key: AuthKey,
+    /// Privacy protocol.
+    pub priv_protocol: PrivProtocol,
+    /// Privacy key material.
+    pub priv_key: PrivKey,
+}
+
+impl UsmUser {
+    /// Validates key material at construction, mirroring the reference's
+    /// `__post_init__` (usm.py): a non-NONE auth protocol requires key
+    /// material, and a localized auth key must be exactly the digest length.
+    pub fn new(
+        username: String,
+        auth_protocol: AuthProtocol,
+        auth_key: AuthKey,
+        priv_protocol: PrivProtocol,
+        priv_key: PrivKey,
+    ) -> Result<Self, Error> {
+        let localized_len = crate::security::usm::kdf::auth_localized_key_length(auth_protocol);
+        match &auth_key {
+            AuthKey::Passphrase(passphrase) => {
+                if auth_enabled(auth_protocol) && passphrase.is_empty() {
+                    return Err(Error::Protocol(ProtocolError::new(format!(
+                        "auth_key: empty/missing key with auth_protocol={auth_protocol:?}; \
+                         supply a passphrase or a {localized_len}-octet localized key"
+                    ))));
+                }
+            }
+            AuthKey::Localized(key) => {
+                if auth_enabled(auth_protocol) && key.len() != localized_len {
+                    return Err(Error::Protocol(ProtocolError::new(format!(
+                        "auth_key: localized key must be {localized_len} octets for \
+                         auth_protocol={auth_protocol:?}, got {}",
+                        key.len()
+                    ))));
+                }
+            }
+        }
+        if priv_protocol != PrivProtocol::None_ {
+            match &priv_key {
+                PrivKey::Passphrase(passphrase) if passphrase.is_empty() => {
+                    return Err(Error::Protocol(ProtocolError::new(format!(
+                        "priv_key: empty/missing key with priv_protocol={priv_protocol:?}; \
+                         supply a passphrase"
+                    ))));
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            username,
+            auth_protocol,
+            auth_key,
+            priv_protocol,
+            priv_key,
+        })
+    }
+}
+
+/// Shared v3 client configuration (its own struct per the de-boilerplate
+/// audit: user + context, no community fields).
+#[derive(Clone)]
+pub struct V3Config {
+    /// Remote host.
+    pub host: String,
+    /// Remote UDP port.
+    pub port: u16,
+    /// USM user credentials.
+    pub user: UsmUser,
+    /// Context name carried in the ScopedPDU.
+    pub context_name: Vec<u8>,
+    /// Optional sender-authoritative engine for traps; `None` means peer
+    /// discovery only.
+    pub local_engine: Option<UsmLocalEngine>,
+    /// Per-attempt response timeout.
+    pub timeout: Duration,
+    /// Retries after the initial attempt.
+    pub retries: u32,
+    /// Clock seam — a real consumer here: engine-time anchors advance with it.
+    pub clock: Arc<dyn Clock>,
+    /// Randomness seam.
+    pub rng: Arc<dyn Rng>,
+}
+
+/// The USM security model (usm.py:UsmModel; §5.4).
+///
+/// Interior mutability: all engine state lives behind one `std::sync::Mutex`
+/// and every method takes `&self`. **Module rule**: no method holds the lock
+/// guard across an await point — `prepare` builds its probe under the lock,
+/// drops it, then awaits the dispatcher.
+pub struct UsmModel {
+    /// The configured user.
+    pub user: UsmUser,
+    /// Context name for outbound ScopedPDUs.
+    pub context_name: Vec<u8>,
+    /// Optional sender-authoritative engine (traps).
+    pub local_engine: Option<UsmLocalEngine>,
+    /// Shared peer/local engine state.
+    state: Mutex<UsmEngineState>,
+    /// Clock for monotonic engine-time anchors.
+    clock: Arc<dyn Clock>,
+}
+
+impl Clone for UsmModel {
+    fn clone(&self) -> Self {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Self {
+            user: self.user.clone(),
+            context_name: self.context_name.clone(),
+            local_engine: self.local_engine.clone(),
+            state: Mutex::new(state),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+}
+
+impl UsmModel {
+    /// Creates a model. `clock` anchors engine-time advancement.
+    #[must_use]
+    pub fn new(
+        user: UsmUser,
+        context_name: Vec<u8>,
+        local_engine: Option<UsmLocalEngine>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            user,
+            context_name,
+            local_engine,
+            state: Mutex::new(UsmEngineState::default()),
+            clock,
+        }
+    }
+
+    /// Whether peer engine discovery has populated authoritative state.
+    #[must_use]
+    pub fn peer_engine_discovered(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peer_engine_id
+            .is_empty()
+    }
+
+    /// Directly adopts peer engine state (used by discovery and the loopback
+    /// conformance harness).
+    pub fn adopt_engine_state(&self, engine_id: Vec<u8>, boots: u32, time: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.adopt_engine_state(engine_id, boots, time, self.clock.monotonic());
+    }
+
+    /// The peer engine id (test/diagnostic surface).
+    #[must_use]
+    pub fn peer_engine_id(&self) -> Vec<u8> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peer_engine_id
+            .clone()
+    }
+
+    // ── SecurityModel protocol ────────────────────────────────────────────
+
+    /// Encodes a PDU into an SNMPv3 USM message (usm.py:wrap_pdu).
+    pub fn wrap_pdu(&self, pdu: &Pdu) -> Result<Vec<u8>, Error> {
+        if self.user.priv_protocol != PrivProtocol::None_ {
+            return Err(Error::Protocol(ProtocolError::new(
+                "privacy (priv_protocol != none) is not implemented until Phase 4 (priv.rs)",
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = self.clock.monotonic();
+        let engine = self.select_outbound_engine(pdu.kind, &mut state, now)?;
+        let flags = msg_flags(pdu.kind, self.user.auth_protocol, self.user.priv_protocol);
+        let msg_id = state.next_msg_id();
+
+        let scoped = encode_scoped_pdu(&engine.engine_id, &self.context_name, pdu)?;
+        let priv_params = Vec::new();
+        let auth_params = if auth_enabled(self.user.auth_protocol) {
+            vec![0u8; auth_tag_length(self.user.auth_protocol)]
+        } else {
+            Vec::new()
+        };
+        let usm = UsmSecurityParameters {
+            engine_id: engine.engine_id.clone(),
+            engine_boots: i64::from(engine.engine_boots),
+            engine_time: i64::from(engine.engine_time),
+            username: self.user.username.as_bytes().to_vec(),
+            auth_params,
+            priv_params,
+        };
+        let raw = encode_v3_message(i64::from(msg_id), MAX_MSG_SIZE, flags, &usm, &scoped)?;
+
+        if auth_enabled(self.user.auth_protocol) {
+            let key = self.auth_key(&engine.engine_id, &mut state)?;
+            drop(state);
+            return auth::stamp_auth(&raw, &key, self.user.auth_protocol);
+        }
+        Ok(raw)
+    }
+
+    /// Validates an inbound datagram and extracts the PDU (usm.py:unwrap_message).
+    ///
+    /// Malformed v3 datagrams, foreign users/engines, and (Phase 4) encrypted
+    /// messages map to [`UnwrapOutcome::NotForUs`]; HMAC failures map to
+    /// [`UnwrapOutcome::AuthFailed`] (never swallowed); adopted engine-recovery
+    /// reports map to [`UnwrapOutcome::EngineRecoveryPending`].
+    pub fn unwrap_message(&self, data: &[u8]) -> UnwrapOutcome {
+        let view = match decode_v3_message(data) {
+            Ok(view) => view,
+            Err(_) => return UnwrapOutcome::NotForUs,
+        };
+        if view.usm_params.username != self.user.username.as_bytes() {
+            return UnwrapOutcome::NotForUs;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.peer_engine_id.is_empty() && view.usm_params.engine_id != state.peer_engine_id {
+            return UnwrapOutcome::NotForUs;
+        }
+        if auth_enabled(self.user.auth_protocol) {
+            let key = match self.auth_key(&view.usm_params.engine_id, &mut state) {
+                Ok(key) => key,
+                Err(_) => return UnwrapOutcome::NotForUs,
+            };
+            if auth::verify_auth(
+                data,
+                view.auth_params_offset,
+                &view.usm_params.auth_params,
+                &key,
+                self.user.auth_protocol,
+            )
+            .is_err()
+            {
+                return UnwrapOutcome::AuthFailed;
+            }
+        }
+        let msg_data = view.msg_data_bytes.clone();
+        drop(state);
+
+        let pdu = match decode_scoped_pdu(&msg_data) {
+            Ok((_engine_id, _context, pdu)) => pdu,
+            Err(_) => return UnwrapOutcome::NotForUs,
+        };
+        if pdu.kind == PduKind::Report {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.handle_report(&pdu, &view, data, &mut state) {
+                return UnwrapOutcome::EngineRecoveryPending;
+            }
+            return UnwrapOutcome::NotForUs;
+        }
+        UnwrapOutcome::Ok(pdu)
+    }
+
+    /// Claims a pending engine-recovery report; `None` when none is pending.
+    #[must_use]
+    pub fn take_recovery(&self) -> Option<EngineReport> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let report = state.recovery_report.take();
+        if report.is_some() {
+            state.engine_recovery_needed = false;
+        }
+        report
+    }
+
+    /// The SNMP version for this model.
+    #[must_use]
+    pub fn version(&self) -> SnmpVersion {
+        SnmpVersion::V3
+    }
+
+    // ── engine discovery ──────────────────────────────────────────────────
+
+    /// Performs RFC 3414 engine discovery: sends a noAuthNoPriv probe with an
+    /// empty engine_id and parses the REPORT response
+    /// (usm.py:prepare, _build_discovery_probe, _parse_discovery_response).
+    ///
+    /// The probe is built under the lock, which is released before awaiting
+    /// the dispatcher (module rule).
+    pub async fn prepare(&self, dispatcher: &RequestDispatcher) -> Result<(), Error> {
+        let probe = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let msg_id = state.next_msg_id();
+            build_discovery_probe(msg_id)?
+        };
+        let response = dispatcher.send_raw_and_receive(&probe).await?;
+        self.parse_discovery_response(&response)
+    }
+
+    fn parse_discovery_response(&self, data: &[u8]) -> Result<(), Error> {
+        let view = decode_v3_message(data).map_err(|error| {
+            Error::Protocol(ProtocolError::new(format!(
+                "Engine discovery: invalid response: {error}"
+            )))
+        })?;
+        let (_engine_id, _context, pdu) =
+            decode_scoped_pdu(&view.msg_data_bytes).map_err(|error| {
+                Error::Protocol(ProtocolError::new(format!(
+                    "Engine discovery: cannot decode ScopedPDU: {error}"
+                )))
+            })?;
+        if pdu.kind != PduKind::Report {
+            return Err(Error::Protocol(ProtocolError::new(format!(
+                "Engine discovery: expected REPORT PDU (0xa8), found 0x{:02x}",
+                pdu.kind.to_raw_tag()
+            ))));
+        }
+        let p = &view.usm_params;
+        if p.engine_id.is_empty() {
+            return Err(Error::Protocol(ProtocolError::new(
+                "Engine discovery: REPORT contained empty engineID",
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.adopt_engine_state(
+            p.engine_id.clone(),
+            p.engine_boots.max(0) as u32,
+            p.engine_time.max(0) as u32,
+            self.clock.monotonic(),
+        );
+        Ok(())
+    }
+
+    // ── engine selection / recovery ────────────────────────────────────────
+
+    fn select_outbound_engine(
+        &self,
+        kind: PduKind,
+        state: &mut UsmEngineState,
+        now: Duration,
+    ) -> Result<UsmLocalEngine, Error> {
+        if kind == PduKind::SnmpV2Trap {
+            let local = self.local_engine.as_ref().ok_or_else(|| {
+                Error::Protocol(ProtocolError::new(
+                    "SNMPv3 traps require local_engine authoritative state \
+                     (engine_id, engine_boots, engine_time)",
+                ))
+            })?;
+            let (advanced, anchor) = advance_local_engine(local, state.local_engine_anchor, now);
+            state.local_engine_anchor = anchor;
+            return Ok(advanced);
+        }
+        if state.peer_engine_id.is_empty() {
+            return Err(Error::Protocol(ProtocolError::new(
+                "SNMPv3 USM engine discovery has not completed; cannot wrap request",
+            )));
+        }
+        Ok(UsmLocalEngine {
+            engine_id: state.peer_engine_id.clone(),
+            engine_boots: state.peer_engine_boots,
+            engine_time: state.current_engine_time(now),
+        })
+    }
+
+    /// Adopts peer engine state from a usmStatsNotInTimeWindows REPORT and
+    /// returns whether a recovery was recorded (usm.py:_handle_inbound_report).
+    fn handle_report(
+        &self,
+        pdu: &Pdu,
+        view: &crate::codec::v3::V3Message,
+        data: &[u8],
+        state: &mut UsmEngineState,
+    ) -> bool {
+        let is_time_window = pdu
+            .varbinds
+            .iter()
+            .any(|varbind| varbind.oid.arcs() == NOT_IN_TIME_WINDOWS_OID);
+        if !is_time_window {
+            return false;
+        }
+        let engine_id = view.usm_params.engine_id.clone();
+        let engine_boots = view.usm_params.engine_boots.max(0) as u32;
+        let engine_time = view.usm_params.engine_time.max(0) as u32;
+        state.adopt_engine_state(
+            engine_id.clone(),
+            engine_boots,
+            engine_time,
+            self.clock.monotonic(),
+        );
+        state.engine_recovery_needed = true;
+        state.recovery_report = Some(EngineReport {
+            raw: data.to_vec(),
+            engine_id,
+            engine_boots,
+            engine_time,
+        });
+        true
+    }
+
+    // ── key derivation ─────────────────────────────────────────────────────
+
+    /// The localized HMAC key for `engine_id` (cached; usm.py:_hmac_key).
+    fn auth_key(
+        &self,
+        engine_id: &[u8],
+        state: &mut UsmEngineState,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let protocol = self.user.auth_protocol;
+        match &self.user.auth_key {
+            AuthKey::Localized(key) => Ok(key.clone()),
+            AuthKey::Passphrase(passphrase) => {
+                if !auth_enabled(protocol) {
+                    return Ok(Zeroizing::new(Vec::new()));
+                }
+                let cache_key = [engine_id.to_vec(), passphrase.clone()].concat();
+                if let Some(cached) = state.localized_cache.get(&cache_key) {
+                    return Ok(cached);
+                }
+                let ku = match state.ku_cache.get(&(protocol, passphrase.clone())) {
+                    Some(ku) => ku.clone(),
+                    None => {
+                        let ku = password_to_ku(passphrase, protocol);
+                        state
+                            .ku_cache
+                            .insert((protocol, passphrase.clone()), ku.clone());
+                        ku
+                    }
+                };
+                // RFC 3414 §2.6 step 2 from the cached Ku:
+                // Kul = H(Ku || engine_id || Ku).
+                let mut input = ku.as_slice().to_vec();
+                input.extend_from_slice(engine_id);
+                input.extend_from_slice(&ku);
+                let localized = plain_digest(&input, protocol);
+                state
+                    .localized_cache
+                    .set(cache_key, Zeroizing::new(localized.clone()));
+                Ok(Zeroizing::new(localized))
+            }
+        }
+    }
+}
+
+/// Plain hash digest (RFC 3414 step 2 uses `H`, not HMAC).
+fn plain_digest(data: &[u8], protocol: AuthProtocol) -> Vec<u8> {
+    match protocol {
+        AuthProtocol::Md5 => digest::<md5::Md5>(data),
+        AuthProtocol::Sha1 => digest::<sha1::Sha1>(data),
+        AuthProtocol::Sha224 => digest::<sha2::Sha224>(data),
+        AuthProtocol::Sha256 => digest::<sha2::Sha256>(data),
+        AuthProtocol::Sha384 => digest::<sha2::Sha384>(data),
+        AuthProtocol::Sha512 => digest::<sha2::Sha512>(data),
+        AuthProtocol::None_ => Vec::new(),
+    }
+}
+
+fn digest<D: hmac::digest::Digest>(data: &[u8]) -> Vec<u8> {
+    let mut hasher = D::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// msgFlags per PDU class (usm.py:_msg_flags): reportable only for confirmed
+/// PDUs; traps and responses carry it cleared.
+fn msg_flags(kind: PduKind, auth: AuthProtocol, priv_protocol: PrivProtocol) -> u8 {
+    let unconfirmed = kind == PduKind::SnmpV2Trap || kind == PduKind::Response;
+    let mut flags = if unconfirmed { 0 } else { MSG_FLAG_REPORTABLE };
+    if auth_enabled(auth) {
+        flags |= MSG_FLAG_AUTH;
+    }
+    if priv_protocol != PrivProtocol::None_ {
+        flags |= MSG_FLAG_PRIV;
+    }
+    flags
+}
+
+/// Builds the RFC 3414 discovery probe: a noAuthNoPriv GET of
+/// usmStatsUnknownUserNames.0 with empty engine parameters.
+fn build_discovery_probe(msg_id: u32) -> Result<Vec<u8>, Error> {
+    let pdu = Pdu {
+        kind: PduKind::GetRequest,
+        request_id: msg_id,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![VarBind::new(
+            Oid::from_arcs(&UNKNOWN_USER_NAMES_OID).expect("fixed OID"),
+            SnmpValue::Null,
+        )],
+        v1_trap: None,
+    };
+    let scoped = encode_scoped_pdu(b"", b"", &pdu)?;
+    let usm = UsmSecurityParameters {
+        engine_id: Vec::new(),
+        engine_boots: 0,
+        engine_time: 0,
+        username: Vec::new(),
+        auth_params: Vec::new(),
+        priv_params: Vec::new(),
+    };
+    encode_v3_message(
+        i64::from(msg_id),
+        MAX_MSG_SIZE,
+        MSG_FLAG_REPORTABLE,
+        &usm,
+        &scoped,
+    )
+    .map_err(Error::Protocol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::usm::kdf::{auth_localized_key_length, localize_key};
+
+    fn clock() -> Arc<dyn Clock> {
+        Arc::new(crate::time::SystemClock)
+    }
+
+    fn user(username: &str, auth: AuthProtocol) -> UsmUser {
+        let key = AuthKey::Localized(Zeroizing::new(vec![0xab; auth_localized_key_length(auth)]));
+        UsmUser::new(
+            username.to_string(),
+            auth,
+            key,
+            PrivProtocol::None_,
+            PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap()
+    }
+
+    fn engine_id() -> Vec<u8> {
+        vec![
+            0x80, 0x00, 0x1f, 0x88, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn get_pdu() -> Pdu {
+        Pdu {
+            kind: PduKind::GetRequest,
+            request_id: 7,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap(),
+                SnmpValue::Null,
+            )],
+            v1_trap: None,
+        }
+    }
+
+    fn discovered() -> UsmModel {
+        let model = UsmModel::new(
+            user("simulator", AuthProtocol::Sha256),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        model.adopt_engine_state(engine_id(), 2, 500);
+        model
+    }
+
+    #[test]
+    fn wrap_unwrap_roundtrip_auth() {
+        let model = discovered();
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        let outcome = model.unwrap_message(&raw);
+        match outcome {
+            UnwrapOutcome::Ok(pdu) => assert_eq!(pdu.request_id, 7),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_emits_protocol_correct_auth_params_length() {
+        for auth in [
+            AuthProtocol::Md5,
+            AuthProtocol::Sha1,
+            AuthProtocol::Sha224,
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ] {
+            let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock());
+            model.adopt_engine_state(engine_id(), 2, 500);
+            let raw = model.wrap_pdu(&get_pdu()).unwrap();
+            let view = decode_v3_message(&raw).unwrap();
+            assert_eq!(view.usm_params.auth_params.len(), auth_tag_length(auth));
+            assert_eq!(view.msg_flags & MSG_FLAG_AUTH, MSG_FLAG_AUTH);
+        }
+    }
+
+    #[test]
+    fn auth_fails_when_tag_tampered() {
+        let model = discovered();
+        let mut raw = model.wrap_pdu(&get_pdu()).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        assert_eq!(model.unwrap_message(&raw), UnwrapOutcome::AuthFailed);
+    }
+
+    #[test]
+    fn wrong_username_is_not_for_us() {
+        let model = discovered();
+        let other = UsmModel::new(
+            user("someone-else", AuthProtocol::Sha256),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        other.adopt_engine_state(engine_id(), 2, 500);
+        let raw = other.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(model.unwrap_message(&raw), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn wrong_engine_is_not_for_us() {
+        let model = discovered();
+        let other = UsmModel::new(
+            user("simulator", AuthProtocol::Sha256),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        other.adopt_engine_state(vec![0x99; 11], 2, 500);
+        let raw = other.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(model.unwrap_message(&raw), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn garbage_bytes_are_not_for_us() {
+        let model = discovered();
+        assert_eq!(
+            model.unwrap_message(b"\xde\xad\xbe\xef"),
+            UnwrapOutcome::NotForUs
+        );
+    }
+
+    #[test]
+    fn noauthnopriv_roundtrip() {
+        let model = UsmModel::new(
+            UsmUser::new(
+                "simulator".to_string(),
+                AuthProtocol::None_,
+                AuthKey::Passphrase(Vec::new()),
+                PrivProtocol::None_,
+                PrivKey::Passphrase(Vec::new()),
+            )
+            .unwrap(),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        model.adopt_engine_state(engine_id(), 2, 500);
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        let view = decode_v3_message(&raw).unwrap();
+        assert_eq!(view.msg_flags & MSG_FLAG_AUTH, 0);
+        match model.unwrap_message(&raw) {
+            UnwrapOutcome::Ok(pdu) => assert_eq!(pdu.request_id, 7),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reportable_flag_cleared_for_response_and_set_for_get() {
+        let model = discovered();
+        let response = Pdu {
+            kind: PduKind::Response,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: Vec::new(),
+            v1_trap: None,
+        };
+        let raw = model.wrap_pdu(&response).unwrap();
+        let view = decode_v3_message(&raw).unwrap();
+        assert_eq!(view.msg_flags & MSG_FLAG_REPORTABLE, 0);
+
+        let raw_get = model.wrap_pdu(&get_pdu()).unwrap();
+        let view = decode_v3_message(&raw_get).unwrap();
+        assert_eq!(view.msg_flags & MSG_FLAG_REPORTABLE, MSG_FLAG_REPORTABLE);
+    }
+
+    #[test]
+    fn trap_wrap_requires_local_engine() {
+        let model = discovered();
+        let trap = Pdu {
+            kind: PduKind::SnmpV2Trap,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            varbinds: Vec::new(),
+            v1_trap: None,
+        };
+        let err = model.wrap_pdu(&trap).unwrap_err();
+        assert!(err.to_string().contains("local_engine"));
+    }
+
+    #[test]
+    fn trap_wrap_uses_local_engine_not_peer() {
+        let local = UsmLocalEngine {
+            engine_id: vec![0xaa; 11],
+            engine_boots: 17,
+            engine_time: 900,
+        };
+        let model = UsmModel::new(
+            user("simulator", AuthProtocol::Sha256),
+            Vec::new(),
+            Some(local),
+            clock(),
+        );
+        model.adopt_engine_state(engine_id(), 2, 500);
+        let trap = Pdu {
+            kind: PduKind::SnmpV2Trap,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            varbinds: Vec::new(),
+            v1_trap: None,
+        };
+        let raw = model.wrap_pdu(&trap).unwrap();
+        let view = decode_v3_message(&raw).unwrap();
+        assert_eq!(view.usm_params.engine_id, vec![0xaa; 11]);
+        assert_eq!(view.usm_params.engine_boots, 17);
+        assert_eq!(view.usm_params.engine_time, 900);
+    }
+
+    #[test]
+    fn passphrase_key_is_localized_against_engine() {
+        let auth = AuthProtocol::Md5;
+        let pw_user = UsmUser::new(
+            "simulator".to_string(),
+            auth,
+            AuthKey::Passphrase(b"maplesyrup".to_vec()),
+            PrivProtocol::None_,
+            PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap();
+        let model = UsmModel::new(pw_user, Vec::new(), None, clock());
+        let engine = engine_id();
+        model.adopt_engine_state(engine.clone(), 2, 500);
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        let view = decode_v3_message(&raw).unwrap();
+        assert_eq!(view.usm_params.auth_params.len(), 12);
+        // The HMAC verifies with the RFC 3414 localized key for this engine.
+        let kul = localize_key(b"maplesyrup", &engine, auth).unwrap();
+        auth::verify_auth(
+            &raw,
+            view.auth_params_offset,
+            &view.usm_params.auth_params,
+            &kul,
+            auth,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn construction_rejects_missing_and_undersized_localized_keys() {
+        let err = UsmUser::new(
+            "x".to_string(),
+            AuthProtocol::Sha256,
+            AuthKey::Passphrase(Vec::new()),
+            PrivProtocol::None_,
+            PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty/missing key"));
+
+        let err = UsmUser::new(
+            "x".to_string(),
+            AuthProtocol::Sha256,
+            AuthKey::Localized(Zeroizing::new(vec![1, 2, 3])),
+            PrivProtocol::None_,
+            PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("localized key must be 32 octets"));
+    }
+
+    #[test]
+    fn auth_tags_differ_across_protocols() {
+        let sha256 = discovered();
+        let sha224 = UsmModel::new(
+            user("simulator", AuthProtocol::Sha224),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        sha224.adopt_engine_state(engine_id(), 2, 500);
+        let a = sha256.wrap_pdu(&get_pdu()).unwrap();
+        let b = sha224.wrap_pdu(&get_pdu()).unwrap();
+        let view_a = decode_v3_message(&a).unwrap();
+        let view_b = decode_v3_message(&b).unwrap();
+        assert_ne!(view_a.usm_params.auth_params, view_b.usm_params.auth_params);
+    }
+
+    #[test]
+    fn sha256_message_rejected_under_sha224() {
+        let model256 = discovered();
+        let model224 = UsmModel::new(
+            user("simulator", AuthProtocol::Sha224),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        model224.adopt_engine_state(engine_id(), 2, 500);
+        let raw = model256.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(model224.unwrap_message(&raw), UnwrapOutcome::AuthFailed);
+    }
+}

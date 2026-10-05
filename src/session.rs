@@ -24,6 +24,10 @@ pub struct SessionConfig {
     pub retries: u32,
     /// Request-id randomness source.
     pub rng: Arc<dyn Rng>,
+    /// Skip the security model's `prepare` (USM discovery) during connect.
+    /// Trap-capable v3 notifiers set it when a `local_engine` is present
+    /// (notify/client.py:open skip_prepare); managers keep it false.
+    pub skip_prepare: bool,
 }
 
 /// An open SNMP session: security model + transport + dispatcher
@@ -62,7 +66,9 @@ impl SnmpSession {
             Arc::clone(&config.rng),
         )?;
         client.open().await.map_err(Error::Transport)?;
-        config.security.prepare(&dispatcher).await?;
+        if !config.skip_prepare {
+            config.security.prepare(&dispatcher).await?;
+        }
         Ok(Self {
             security: config.security,
             client,
