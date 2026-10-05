@@ -199,8 +199,12 @@ struct RawType {
 }
 
 /// Raw module payload as it appears in a module JSON file
-/// (registry.py:541–587). The collection fields stay raw so each normalize
-/// function owns its validation; `None` ≡ absent (≡ `{}` in Python).
+/// (registry.py:541–587). The collection fields (`imports`/`objects`/
+/// `notifications`/`types`) are intentionally absent here: presence vs
+/// present-`null` matters for them (see [`normalize_module_payload`]), and
+/// serde's `Option` cannot distinguish the two, so they are read directly
+/// from the payload object. `module_metadata` is the one collection whose
+/// explicit `null` is accepted by both implementations (it maps to `{}`).
 #[derive(Debug, Deserialize)]
 struct RawModule {
     module: String,
@@ -213,14 +217,6 @@ struct RawModule {
     schema_version: Option<serde_json::Value>,
     #[serde(default)]
     producer_version: Option<serde_json::Value>,
-    #[serde(default)]
-    imports: Option<serde_json::Value>,
-    #[serde(default)]
-    objects: Option<serde_json::Value>,
-    #[serde(default)]
-    notifications: Option<serde_json::Value>,
-    #[serde(default)]
-    types: Option<serde_json::Value>,
     #[serde(default)]
     module_metadata: Option<serde_json::Value>,
 }
@@ -325,7 +321,9 @@ fn normalize_imports(
 }
 
 /// Resolves a node's OID from its `oid_path` and/or `oid` fields
-/// (registry.py:445–468).
+/// (registry.py:445–468). A present `oid` string is parsed strictly even when
+/// `oid_path` wins — a malformed `oid` errors exactly like the reference's
+/// `parse_oid(oid_value)` propagating `InvalidOidError` (registry.py:458).
 fn normalize_node_oid(
     oid_path: Option<Vec<u32>>,
     oid_value: Option<&str>,
@@ -339,14 +337,16 @@ fn normalize_node_oid(
                 format!("Node {name:?} has an invalid oid_path: {}", e.0),
             )
         })?;
-        if let Some(text) = oid_value
-            && let Ok(parsed) = Oid::parse(text)
-            && parsed != oid
-        {
-            return Err(validation(
-                path,
-                format!("Node {name:?} has inconsistent oid and oid_path values"),
-            ));
+        if let Some(text) = oid_value {
+            let parsed = Oid::parse(text).map_err(|e| {
+                validation(path, format!("Node {name:?} has an invalid oid: {}", e.0))
+            })?;
+            if parsed != oid {
+                return Err(validation(
+                    path,
+                    format!("Node {name:?} has inconsistent oid and oid_path values"),
+                ));
+            }
         }
         return Ok(oid);
     }
@@ -523,14 +523,29 @@ pub fn normalize_module_payload(
         producer_version.as_deref(),
     )?;
     let module_metadata = normalize_module_metadata(raw.module_metadata.as_ref(), path)?;
-    let objects = normalize_node_map(raw.objects.as_ref(), &raw.module, path, None)?;
-    let notifications = normalize_node_map(
-        raw.notifications.as_ref(),
-        &raw.module,
+    let payload_obj = payload.as_object().expect("checked above");
+    // Each collection distinguishes "absent" (`None` ≡ `{}` via Python's
+    // `payload.get(key, {})` default) from "present with an explicit null"
+    // (`get` returns the stored `None` and the isinstance check rejects it,
+    // registry.py:575, 314–316, 331–333, 409–411).
+    let objects = normalize_collection_field(
+        payload_obj.get("objects"),
         path,
-        Some("notification"),
+        "Node collections must be an object",
+        |value| normalize_node_map(Some(value), &raw.module, path, None),
     )?;
-    let types = normalize_type_map(raw.types.as_ref(), &raw.module, path)?;
+    let notifications = normalize_collection_field(
+        payload_obj.get("notifications"),
+        path,
+        "Node collections must be an object",
+        |value| normalize_node_map(Some(value), &raw.module, path, Some("notification")),
+    )?;
+    let types = normalize_collection_field(
+        payload_obj.get("types"),
+        path,
+        "Type collections must be an object",
+        |value| normalize_type_map(Some(value), &raw.module, path),
+    )?;
 
     let record = MibModuleRecord {
         language: raw.language.and_then(|v| v.as_str().map(str::to_string)),
@@ -541,7 +556,12 @@ pub fn normalize_module_payload(
         generated_by: raw.generated_by,
         schema_version,
         producer_version,
-        imports: normalize_imports(raw.imports.as_ref(), path)?,
+        imports: normalize_collection_field(
+            payload_obj.get("imports"),
+            path,
+            "Module imports must be an object",
+            |value| normalize_imports(Some(value), path),
+        )?,
         objects,
         notifications,
         types,
@@ -549,6 +569,25 @@ pub fn normalize_module_payload(
     };
     validate_module_record(&record, path)?;
     Ok(record)
+}
+
+/// Applies a normalize function to a collection field read from the raw
+/// payload object (registry.py:575): an absent field yields the empty default,
+/// a present explicit `null` is rejected with `message`, and a present value
+/// is validated by `normalize`.
+fn normalize_collection_field<T>(
+    field: Option<&serde_json::Value>,
+    path: &Path,
+    null_message: &str,
+    normalize: impl FnOnce(&serde_json::Value) -> Result<T, BundleError>,
+) -> Result<T, BundleError> {
+    match field {
+        None => Ok(normalize(&serde_json::Value::Object(
+            serde_json::Map::new(),
+        ))?),
+        Some(serde_json::Value::Null) => Err(validation(path, null_message)),
+        Some(value) => normalize(value),
+    }
 }
 
 #[cfg(test)]

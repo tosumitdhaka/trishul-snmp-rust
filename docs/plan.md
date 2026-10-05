@@ -84,7 +84,7 @@ All fixture directories carry a `SOURCE.md` naming the producing repo + revision
 | Directory | Content |
 |---|---|
 | `fixtures/crypto-vectors/` | net-snmp 5.9.4 engine-ID + passphrase → localized-key ground truth; draft-reeder Appendix B byte-exact vectors (machine-readable TOML/JSON) |
-| `fixtures/bundles/` | tsmi compiled-JSON modules + `manifest.json`/`oid_index.json` sidecars — identical artifacts validate both implementations |
+| `fixtures/bundles/` | tsmi compiled-JSON modules (identical artifacts validate both implementations). The `manifest.json`/`oid_index.json` sidecars are **not** vendored — `mibs-output/` carries none, and both are optional in the format; tests synthesize them (Python: `tests/_bundle_fixtures.py`; Rust: `tests/common/mib.rs`). Provenance: `fixtures/bundles/SOURCE.md` |
 | `fixtures/wire-golden/` | byte-exact encodings generated once by the Python codec (v1/v2c/v3 messages) for cross-language byte parity; generated under a **pinned** `cryptography` release (48.0.0 verified full-block CFB — older releases defaulted `modes.CFB` to 8-bit segments, which would corrupt v3-priv goldens) |
 | `fixtures/snmpd/` | snmpd.conf matrix: v3 users (tsnmpuser, user224, user384, user512, userSha256Aes192), agents on 127.0.0.1:1161/1162/1171/1173/1174 |
 

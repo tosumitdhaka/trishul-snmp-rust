@@ -111,9 +111,11 @@ impl MibBundle {
     }
 
     /// Finds the closest known object for `oid` (bundle.py:40–42;
-    /// registry.py:183–217).
-    pub fn lookup(&self, oid: &Oid) -> Result<OidMatch, TranslationError> {
-        self.inner.lookup_oid(oid)
+    /// registry.py:183–217). Errors with [`TranslationError::UnknownOid`]
+    /// when nothing matches; the error rides the top-level [`Error`] like the
+    /// other facade methods.
+    pub fn lookup(&self, oid: &Oid) -> Result<OidMatch, Error> {
+        Ok(self.inner.lookup_oid(oid)?)
     }
 
     /// Resolves value-rendering metadata (enums/units/syntax) for the object

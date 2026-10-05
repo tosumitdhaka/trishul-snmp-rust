@@ -17,10 +17,17 @@ use crate::types::varbind::{OidMatch, VarBind};
 /// (render.py:19–60).
 pub fn enrich_varbinds(bundle: Option<&MibBundle>, varbinds: Vec<VarBind>) -> Vec<VarBind> {
     if bundle.is_none() {
+        // Fresh varbinds, exactly like render.py:22–30: enrichment fields are
+        // reset (a caller re-enriching an already-enriched varbind loses the
+        // stale metadata), only the raw display string is populated.
         return varbinds
             .into_iter()
             .map(|varbind| VarBind {
+                matched: None,
+                display_name: None,
                 display_value: Some(varbind.value.to_string()),
+                enum_label: None,
+                units: None,
                 ..varbind
             })
             .collect();
@@ -190,11 +197,8 @@ fn constraint_enum_map(constraints: Option<&serde_json::Value>) -> Option<BTreeM
     let data = data.as_array()?;
     let mut result = BTreeMap::new();
     for item in data {
-        let pair = item.as_array()?;
-        if pair.len() == 2
-            && let (Some(label), Some(number)) = (pair[0].as_str(), pair[1].as_i64())
-        {
-            result.insert(label.to_string(), number);
+        if let Some((label, number)) = constraint_pair(item) {
+            result.insert(label, number);
         }
     }
     if result.is_empty() {
@@ -202,6 +206,22 @@ fn constraint_enum_map(constraints: Option<&serde_json::Value>) -> Option<BTreeM
     } else {
         Some(result)
     }
+}
+
+/// Extracts a `[label, number]` pair from one constraint-data item, skipping
+/// malformed items the way the reference does (render.py:204–211). Numbers
+/// accept JSON booleans (`isinstance(item[1], int)` in Python — `true` is an
+/// int subclass, so `["up", true]` maps `up` → 1).
+fn constraint_pair(item: &serde_json::Value) -> Option<(String, i64)> {
+    let pair = item.as_array()?;
+    if pair.len() != 2 {
+        return None;
+    }
+    let label = pair[0].as_str()?;
+    let number = pair[1]
+        .as_i64()
+        .or_else(|| pair[1].as_bool().map(i64::from));
+    Some((label.to_string(), number?))
 }
 
 /// Resolves the label for `value` from a label→number map (render.py:115–126).
@@ -223,12 +243,10 @@ fn enum_label_from_constraints(
     let data = constraints?.as_object()?.get("data")?;
     let data = data.as_array()?;
     for item in data {
-        let pair = item.as_array()?;
-        if pair.len() == 2
-            && let (Some(label), Some(number)) = (pair[0].as_str(), pair[1].as_i64())
+        if let Some((label, number)) = constraint_pair(item)
             && number == value
         {
-            return Some(label.to_string());
+            return Some(label);
         }
     }
     None
@@ -428,6 +446,60 @@ mod tests {
         assert_eq!(constraint_enum_map(None), None);
         assert_eq!(constraint_kind(Some(&json!({"kind": 3}))), None);
         assert_eq!(enum_label_from_map(&BTreeMap::new(), 1), None);
+    }
+
+    #[test]
+    fn constraint_scan_skips_malformed_items_and_accepts_bools() {
+        // Python's constraint scan skips malformed items instead of aborting
+        // (render.py:204–211, 235–243), and `isinstance(item[1], int)`
+        // accepts JSON booleans (a Python bool is an int subclass).
+        let constraints = json!({
+            "kind": "enum",
+            "data": [["up", 1], "bad", [1, 2], [null, 3], ["down", true], ["dup", 1]]
+        });
+        let map = constraint_enum_map(Some(&constraints)).expect("map builds");
+        assert_eq!(map.get("up"), Some(&1));
+        assert_eq!(map.get("down"), Some(&1), "bool true == int 1");
+        assert!(!map.contains_key("bad"));
+        // A later duplicate label overwrites the earlier entry.
+        assert_eq!(map.get("dup"), Some(&1));
+
+        assert_eq!(
+            enum_label_from_constraints(
+                Some(&json!({"kind": "enum", "data": ["bad", ["up", true]]})),
+                1,
+            ),
+            Some("up".to_string())
+        );
+        // A non-enum constraint keeps returning None even with malformed data.
+        assert_eq!(
+            enum_label_from_constraints(Some(&json!({"kind": "range", "data": "bad"})), 1),
+            None
+        );
+    }
+
+    #[test]
+    fn enrich_without_bundle_resets_preexisting_enrichment() {
+        // render.py:22–30 builds fresh varbinds: a no-bundle enrichment of an
+        // already-enriched varbind resets the stale metadata, keeping only the
+        // raw display string.
+        let input = VarBind {
+            matched: Some(match_for("status", "APP-MIB")),
+            display_name: Some("APP-MIB::status".to_string()),
+            display_value: Some("stale".to_string()),
+            enum_label: Some("up".to_string()),
+            units: Some("bits".to_string()),
+            ..VarBind::new(
+                Oid::from_arcs(&[1, 3, 6, 1]).unwrap(),
+                SnmpValue::Integer(1),
+            )
+        };
+        let enriched = enrich_varbinds(None, vec![input]);
+        assert_eq!(enriched[0].matched, None);
+        assert_eq!(enriched[0].display_name, None);
+        assert_eq!(enriched[0].display_value.as_deref(), Some("1"));
+        assert_eq!(enriched[0].enum_label, None);
+        assert_eq!(enriched[0].units, None);
     }
 
     #[test]

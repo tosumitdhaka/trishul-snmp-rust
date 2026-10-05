@@ -132,6 +132,13 @@ fn directory_module_paths(path: &Path) -> Result<Vec<PathBuf>, BundleError> {
 }
 
 /// Reads the manifest and resolves its module inventory (loader.py:105–143).
+///
+/// Containment follows symlinks: `fs::canonicalize` resolves the module path
+/// the way Python's `Path.resolve()` does (loader.py:128–133), so a manifest
+/// entry pointing through a symlink at a file outside the bundle directory is
+/// rejected. For paths that do not exist yet (checked after containment),
+/// canonicalization fails and a lexical normalization is used instead —
+/// matching `Path.resolve(strict=False)`.
 fn module_paths_from_manifest(
     bundle_dir: &Path,
     manifest_path: &Path,
@@ -164,13 +171,19 @@ fn module_paths_from_manifest(
         });
     }
 
-    let bundle_dir_resolved = lexical_resolve(bundle_dir);
+    let bundle_dir_resolved = fs::canonicalize(bundle_dir).unwrap_or_else(|_| {
+        // The bundle directory exists (we just read the manifest from it), but
+        // canonicalize can still fail on unusual mounts; fall back to a
+        // lexical normalization so the containment check stays total.
+        lexical_resolve(bundle_dir)
+    });
     let mut module_paths = Vec::new();
     let mut seen_files: BTreeSet<PathBuf> = BTreeSet::new();
     for entry in modules {
         let file_name = manifest_module_filename(entry, manifest_path)?;
         let module_path = bundle_dir.join(&file_name);
-        let resolved = lexical_resolve(&module_path);
+        let resolved =
+            fs::canonicalize(&module_path).unwrap_or_else(|_| lexical_resolve(&module_path));
         if !resolved.starts_with(&bundle_dir_resolved) {
             return Err(BundleError::Validation {
                 path: manifest_path.display().to_string(),

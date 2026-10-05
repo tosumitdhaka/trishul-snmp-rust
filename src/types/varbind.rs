@@ -104,11 +104,13 @@ pub struct OidMatch {
     pub matched_oid: Oid,
     /// Arc suffix past the matched prefix (empty when exact).
     pub suffix: Oid,
-    /// `OBJECT-TYPE`, `OBJECT-IDENTITY`, … (← `class_name`).
+    /// Producer class label (`objecttype`, `moduleidentity`, `objectidentifier`,
+    /// `notificationtype`, …) (← the reference's `class_name`).
     pub class_name: Option<String>,
-    /// `scalar`, `table`, … (← `object_type`).
+    /// `OBJECT-TYPE`, `MODULE-IDENTITY`, `OBJECT IDENTIFIER`,
+    /// `NOTIFICATION-TYPE`, … (← the reference's `object_type`).
     pub object_type: Option<String>,
-    /// `node`, `scalar`, `column`, … (← `nodetype`).
+    /// `scalar`, `table`, `column`, … (← `nodetype`).
     pub nodetype: Option<String>,
 }
 

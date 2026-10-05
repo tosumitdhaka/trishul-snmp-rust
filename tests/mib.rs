@@ -469,6 +469,36 @@ fn manifest_paths_validation_and_dedup() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn manifest_symlink_escape_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    // A module file living outside the bundle directory, referenced through a
+    // symlink inside it: Python's `Path.resolve()` follows the link and the
+    // containment check rejects it (loader.py:128–133); the Rust loader
+    // canonicalizes the same way.
+    let outside = TempDir::new("symlink-outside");
+    write_json(&outside.path().join("IF-MIB.json"), &if_mib_payload(true));
+    let tmp = TempDir::new("symlink-escape");
+    symlink(
+        outside.path().join("IF-MIB.json"),
+        tmp.path().join("IF-MIB.json"),
+    )
+    .unwrap();
+    write_json(
+        &tmp.path().join("manifest.json"),
+        &json!({"modules": ["IF-MIB.json"]}),
+    );
+
+    let err = load_bundle(tmp.path()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Manifest module file must stay within the bundle directory"),
+        "{err}"
+    );
+}
+
 #[test]
 fn oid_index_validation_errors() {
     let tmp = TempDir::new("oididx");
@@ -512,7 +542,10 @@ fn oid_index_validation_errors() {
         "{err}"
     );
 
-    // A malformed OID key is rejected.
+    // A malformed OID key is rejected. (The reference's non-string-key case —
+    // a Python dict with an int key — is impossible in JSON, where object
+    // keys are always strings; this malformed-string-key case is the JSON
+    // equivalent, see docs/architecture.md §8.)
     write_json(
         &tmp.path().join("oid_index.json"),
         &json!({"not-an-oid": {"module": "APP-MIB", "object": "status"}}),
@@ -829,7 +862,10 @@ fn parse_symbolic_target_and_translation_edges() {
     let err = bundle
         .lookup(&oid(&[1, 3, 6, 1, 4, 1, 99999, 250]))
         .unwrap_err();
-    assert!(matches!(err, TranslationError::UnknownOid(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Translation(TranslationError::UnknownOid(_))),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -965,6 +1001,18 @@ fn normalize_node_oid_and_string_helpers_validation_errors() {
         )
         .is_err()
     );
+    // A malformed oid string alongside a valid oid_path is rejected, exactly
+    // like the reference's `parse_oid(oid_value)` propagating InvalidOidError
+    // (registry.py:458) — it is not silently ignored.
+    assert!(
+        normalize_node_map(
+            Some(&json!({"node": valid_node(&json!({"oid": "not-an-oid"}))})),
+            "APP-MIB",
+            path,
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -980,6 +1028,34 @@ fn normalize_module_metadata_and_payload_validation_errors() {
     assert!(normalize_module_payload(&json!([]), path).is_err());
     assert!(normalize_module_payload(&json!({"generated_by": "trishul-smi"}), path,).is_err());
     assert!(normalize_module_payload(&json!({"module": "APP-MIB"}), path).is_err());
+}
+
+#[test]
+fn explicit_null_collections_are_rejected() {
+    // A present-`null` for imports/objects/notifications/types is rejected
+    // exactly like the reference's `payload.get(key, {})` returning the
+    // stored `None` (registry.py:575, 314–316, 331–333, 409–411).
+    let path = std::path::Path::new("/virtual/x.json");
+    for (field, message) in [
+        ("imports", "Module imports must be an object"),
+        ("objects", "Node collections must be an object"),
+        ("notifications", "Node collections must be an object"),
+        ("types", "Type collections must be an object"),
+    ] {
+        let mut payload = base_module("APP-MIB", None);
+        payload[field] = serde_json::Value::Null;
+        let err = normalize_module_payload(&payload, path).unwrap_err();
+        assert!(err.to_string().contains(message), "{field}: {err}");
+    }
+    // `module_metadata: null` is accepted by both implementations (mapped to
+    // the empty object).
+    let mut payload = base_module("APP-MIB", None);
+    payload["module_metadata"] = serde_json::Value::Null;
+    let record = normalize_module_payload(&payload, path).unwrap();
+    assert_eq!(
+        record.module_metadata,
+        serde_json::Value::Object(serde_json::Map::new())
+    );
 }
 
 #[test]
@@ -1375,7 +1451,10 @@ fn alias_bundle_prefers_parent_scalar_for_display_name() {
 fn vendored_bundle_translates_and_resolves() {
     let bundle = load(vendored_bundles());
     let module_names: Vec<&str> = bundle.modules().keys().map(String::as_str).collect();
-    assert_eq!(module_names, vec!["IF-MIB", "IPV6-TC", "SNMPv2-MIB"]);
+    assert_eq!(
+        module_names,
+        vec!["IF-MIB", "IPV6-TC", "SNMPv2-MIB", "TEST-E2E-MIB"]
+    );
 
     assert_eq!(
         bundle.translate("IF-MIB::ifDescr").unwrap(),
@@ -1410,7 +1489,11 @@ fn vendored_bundle_translates_and_resolves() {
 }
 
 #[test]
-fn vendored_bundle_renders_enum_bits_and_units() {
+fn vendored_bundle_renders_enums() {
+    // Enum rendering against the vendored IF-MIB. The vendored bundles carry
+    // no BITS/UNITS objects, so those render paths are exercised separately
+    // against the tsmi-compiled TEST-E2E-MIB fixture
+    // (`vendored_bundle_renders_bits_and_units`).
     let bundle = load(vendored_bundles());
     let enriched = enrich_varbinds(
         Some(&bundle),
@@ -1455,6 +1538,35 @@ fn vendored_bundle_renders_enum_bits_and_units() {
         Some("IF-MIB::ifIndex.7")
     );
     assert_eq!(enriched[4].display_value.as_deref(), Some("7"));
+}
+
+#[test]
+fn vendored_bundle_renders_bits_and_units() {
+    // The tsmi-compiled TEST-E2E-MIB fixture (fixtures/bundles/SOURCE.md)
+    // carries the BITS and UNITS objects the other vendored modules lack —
+    // the same golden varbinds the reference's test_mib_tsmi_e2e.py asserts.
+    let bundle = load(vendored_bundles());
+    let enriched = enrich_varbinds(
+        Some(&bundle),
+        vec![
+            vb(&[1, 3, 6, 1, 4, 1, 99999, 1, 0], SnmpValue::Integer(1)),
+            vb(&[1, 3, 6, 1, 4, 1, 99999, 2, 0], SnmpValue::Integer(7)),
+            vb(
+                &[1, 3, 6, 1, 4, 1, 99999, 3, 0],
+                SnmpValue::OctetString(vec![0x80]),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        enriched[0].display_name.as_deref(),
+        Some("TEST-E2E-MIB::status.0")
+    );
+    assert_eq!(enriched[0].display_value.as_deref(), Some("up(1)"));
+    assert_eq!(enriched[0].enum_label.as_deref(), Some("up"));
+    assert_eq!(enriched[1].display_value.as_deref(), Some("7"));
+    assert_eq!(enriched[1].units.as_deref(), Some("bits/second"));
+    assert_eq!(enriched[2].display_value.as_deref(), Some("red(0)"));
 }
 
 #[test]

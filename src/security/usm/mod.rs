@@ -179,6 +179,12 @@ pub struct V3Config {
     /// discovery only.
     pub local_engine: Option<UsmLocalEngine>,
     /// Optional MIB bundle for symbolic targets and response enrichment.
+    ///
+    /// This field rides on the security config only because that is where the
+    /// Python reference exposes it (`V3Manager(..., bundle=...)`,
+    /// manager/client.py:47); it is threaded straight into
+    /// [`SessionConfig::bundle`](crate::session::SessionConfig::bundle) and is
+    /// never consulted by the security model itself.
     pub bundle: Option<Arc<MibBundle>>,
     /// Per-attempt response timeout.
     pub timeout: Duration,
