@@ -118,7 +118,7 @@ impl KeyCache {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }
@@ -177,6 +177,7 @@ impl UsmEngineState {
     ) {
         if engine_id != self.peer_engine_id || engine_boots != self.peer_engine_boots {
             self.localized_cache.clear();
+            self.priv_key_cache.clear();
         }
         self.peer_engine_id = engine_id;
         self.peer_engine_boots = engine_boots;

@@ -60,10 +60,17 @@ impl CounterRng {
 
 impl Rng for CounterRng {
     fn fill_bytes(&self, buf: &mut [u8]) {
+        // Review N1: fills ANY buffer length deterministically (big-endian
+        // counter bytes, repeated per 4-byte chunk). For 4-byte draws this
+        // preserves the historical sequence — first draw of
+        // CounterRng::new(7) is [0, 0, 0, 7] (7 as a BE u32), exactly as
+        // before, so existing request-id assertions are unaffected.
         let mut next = self.next.lock().unwrap();
-        let value = *next;
-        *next = next.wrapping_add(1);
-        buf.copy_from_slice(&value.to_be_bytes());
+        for chunk in buf.chunks_mut(4) {
+            let value = *next;
+            *next = next.wrapping_add(1);
+            chunk.copy_from_slice(&value.to_be_bytes()[..chunk.len()]);
+        }
     }
 }
 

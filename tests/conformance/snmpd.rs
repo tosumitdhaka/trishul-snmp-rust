@@ -28,7 +28,6 @@ use trishul_snmp::types::varbind::ErrorStatus;
 const AGENT_PORT: u16 = 1161;
 const SYSTEM_ROOT: &str = "1.3.6.1.2.1.1";
 const SYS_UPTIME_INSTANCE: &str = "1.3.6.1.2.1.1.3.0";
-const OID_SYS_DESCR_INSTANCE: &str = "1.3.6.1.2.1.1.1.0";
 const SYS_DESCR_INSTANCE: &str = "1.3.6.1.2.1.1.1.0";
 
 /// Whether the gate is open (TSNMP_SNMPD set to exactly "1").
@@ -68,6 +67,15 @@ fn v3_conf(port: u16) -> String {
             line.starts_with("engineID ")
                 || line.starts_with("createUser ")
                 || line.starts_with("rouser ")
+                // v3view's VACM story (review I3): without these lines the
+                // user has no access entry and every request is refused with
+                // AuthorizationError. With them, RFC 3415 picks the noauth
+                // access row for higher-level requests, so v3view serves
+                // authPriv GETs within its `restricted` view.
+                || line.starts_with("view restricted ")
+                || line.starts_with("com2sec restsec ")
+                || line.starts_with("group restgroup ")
+                || line.starts_with("access restgroup ")
         })
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -85,11 +93,18 @@ fn v3_conf(port: u16) -> String {
     relevant.join("\n")
 }
 
-/// The v3 agent binds the fixture's 1162 (the fixture's v3 users are pinned to
-/// that port; USM identity is the engineID, and the createUser lines are kept
-/// byte-identical). If the port is occupied at test time the suite self-skips
-/// with a clear message rather than falling back to another port.
+/// The v3 authNoPriv agent binds the fixture's 1162 (the fixture's v3 users
+/// are pinned to that port; USM identity is the engineID, and the createUser
+/// lines are kept byte-identical). If the port is occupied at test time the
+/// suite self-skips with a clear message rather than falling back.
 const V3_PORT: u16 = 1162;
+
+/// The v3 authPriv agent binds a DISTINCT port from the authNoPriv suite so
+/// the two suites can run in parallel under the default test harness (each
+/// spawns its own snmpd; the loser of a shared port would fail to bind and
+/// the readiness loop would spin — review I2). 1174 is the fixture's
+/// dedicated v3-only port in the reference deployment.
+const V3_PRIV_PORT: u16 = 1174;
 
 /// Spawns a snmpd with `conf`; returns the child plus the working directory.
 /// Kills the snmpd child on drop so a panicking test cannot leak an agent.
@@ -370,7 +385,7 @@ async fn conformance_v3_authpriv_matrix() {
         eprintln!("TSNMP_SNMPD unset: skipping snmpd v3 authPriv conformance suite");
         return;
     }
-    let port = V3_PORT;
+    let port = V3_PRIV_PORT;
     let Some((mut agent, _workdir)) = spawn_snmpd(&v3_conf(port), "v3priv") else {
         eprintln!("conformance: cannot spawn snmpd for the v3 authPriv agent on {port}; skipping");
         return;
@@ -382,10 +397,10 @@ async fn conformance_v3_authpriv_matrix() {
         );
         return;
     }
-    // authPriv users from the fixture's createUser rows. v3view is excluded
-    // deliberately: the fixture's `access restgroup "" any noauth exact …` row
-    // restricts that user to noAuth requests, so an authPriv GET is rejected
-    // with AuthorizationError by design.
+    // authPriv users from the fixture's createUser rows. v3view is included:
+    // with the VACM group/access lines present (v3_conf), RFC 3415 grants its
+    // authPriv requests under the noauth access row's `restricted` view
+    // (review I3 — the earlier AuthorizationError was the dropped VACM lines).
     let matrix = [
         ("tsnmpuser", AuthProtocol::Sha256, PrivProtocol::Aes256),
         ("user224", AuthProtocol::Sha224, PrivProtocol::Aes256),
@@ -396,14 +411,21 @@ async fn conformance_v3_authpriv_matrix() {
             AuthProtocol::Sha256,
             PrivProtocol::Aes192,
         ),
+        ("v3view", AuthProtocol::Sha256, PrivProtocol::Aes128),
         ("v3only", AuthProtocol::Sha256, PrivProtocol::Aes128),
     ];
     for (username, auth, priv_protocol) in matrix {
-        let user = v3_authpriv_user(username, auth, priv_protocol, "privpassword12345");
-        // Readiness per user: discovery + an authed+priv'd get.
+        let user = v3_authpriv_user(username, auth, priv_protocol);
+        // Readiness per user: discovery + an authed+priv'd get. The connect
+        // failure branch MUST also check the deadline (review I2: under
+        // parallel invocation a bind failure would otherwise spin forever).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let manager = loop {
             let Ok(manager) = Manager::connect_v3(v3_config(port, user.clone())).await else {
+                if tokio::time::Instant::now() >= deadline {
+                    agent.kill();
+                    panic!("{username}: authPriv agent never became reachable");
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
@@ -432,7 +454,7 @@ async fn conformance_v3_authpriv_matrix() {
         );
         // getnext: sysDescr.0 -> sysObjectID.0
         let response = manager
-            .get_next(vec![OID_SYS_DESCR_INSTANCE])
+            .get_next(vec![SYS_DESCR_INSTANCE])
             .await
             .unwrap_or_else(|e| panic!("{username}: getnext failed: {e}"));
         assert_eq!(
@@ -442,7 +464,7 @@ async fn conformance_v3_authpriv_matrix() {
         );
         // getbulk: the system subtree in one shot.
         let response = manager
-            .get_bulk(vec![OID_SYS_DESCR_INSTANCE], 0, 5)
+            .get_bulk(vec![SYS_DESCR_INSTANCE], 0, 5)
             .await
             .unwrap_or_else(|e| panic!("{username}: getbulk failed: {e}"));
         assert_eq!(
@@ -468,6 +490,35 @@ async fn conformance_v3_authpriv_matrix() {
             "{username}: system subtree walk returned {} varbinds",
             walked.len()
         );
+        if username == "v3view" {
+            // Port of the reference restricted-view tests
+            // (test_snmpd_integration.py view suite): an inside-view GET is
+            // served with a real value; an outside-view GET surfaces a
+            // noSuchObject varbind under NO_ERROR.
+            let inside = manager
+                .get(vec![SYS_DESCR_INSTANCE])
+                .await
+                .unwrap_or_else(|e| panic!("v3view: inside-view get failed: {e}"));
+            assert_eq!(inside.error_status, ErrorStatus::NoError);
+            assert!(
+                matches!(inside.varbinds[0].value, SnmpValue::OctetString(_)),
+                "v3view: inside-view sysDescr should be served, got {:?}",
+                inside.varbinds[0].value
+            );
+            let outside = manager
+                .get(vec!["1.3.6.1.2.1.2.2.1.1.1"])
+                .await
+                .unwrap_or_else(|e| panic!("v3view: outside-view get failed: {e}"));
+            assert_eq!(outside.error_status, ErrorStatus::NoError);
+            assert!(
+                matches!(
+                    outside.varbinds[0].value,
+                    SnmpValue::NoSuchObject | SnmpValue::EndOfMibView
+                ),
+                "v3view: outside-view ifIndex.1 should be restricted, got {:?}",
+                outside.varbinds[0].value
+            );
+        }
     }
     agent.kill();
     eprintln!("conformance: v3 authPriv matrix passed against live snmpd");
@@ -484,17 +535,12 @@ fn version_marker_compiles() {
 // ── v3 conformance helpers ──────────────────────────────────────────────────
 
 fn v3_user(username: &str, auth: AuthProtocol) -> UsmUser {
-    v3_authpriv_user(username, auth, PrivProtocol::None_, "")
+    v3_authpriv_user(username, auth, PrivProtocol::None_)
 }
 
 /// An authPriv user matching the fixture's createUser rows
 /// (auth "authpassword12345", priv "privpassword12345").
-fn v3_authpriv_user(
-    username: &str,
-    auth: AuthProtocol,
-    priv_protocol: PrivProtocol,
-    _priv_password: &str,
-) -> UsmUser {
+fn v3_authpriv_user(username: &str, auth: AuthProtocol, priv_protocol: PrivProtocol) -> UsmUser {
     UsmUser::new(
         username.to_string(),
         auth,

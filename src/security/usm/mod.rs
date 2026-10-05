@@ -622,6 +622,14 @@ impl UsmModel {
         engine_id: &[u8],
         state: &mut UsmEngineState,
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        if !auth_enabled(self.user.auth_protocol) {
+            // RFC 3414 requires auth for priv; the reference raises at
+            // derivation time (usm.py:874, 914, 939). This also guards the
+            // Localized-key extension loop (review I1).
+            return Err(Error::Protocol(ProtocolError::new(
+                "Cannot derive priv key without an auth protocol",
+            )));
+        }
         let protocol = self.user.priv_protocol;
         if protocol == PrivProtocol::None_ {
             return Err(Error::Protocol(ProtocolError::new(
@@ -629,11 +637,9 @@ impl UsmModel {
             )));
         }
         match &self.user.priv_key {
-            PrivKey::Localized(key) => Ok(privacy::adapt_localized_key(
-                key,
-                protocol,
-                self.user.auth_protocol,
-            )),
+            PrivKey::Localized(key) => {
+                privacy::adapt_localized_key(key, protocol, self.user.auth_protocol)
+            }
             PrivKey::Passphrase(passphrase) => {
                 if passphrase.is_empty() {
                     return Err(Error::Protocol(ProtocolError::new(format!(
@@ -1425,12 +1431,91 @@ mod tests {
 
     #[test]
     fn priv_key_cache_invalidated_on_boots_change() {
+        // Review I5: the reference clears `_localized_priv_cache` when the
+        // engine id or boots change (usm.py); the priv cache must be
+        // invalidated too — the NAME says invalidated, and that is what we
+        // assert (re-derivation being deterministic is a separate fact).
         let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
         let mut state = UsmEngineState::default();
         let k1 = model.priv_key(&engine_id(), &mut state).unwrap();
+        assert_eq!(
+            state.priv_key_cache.len(),
+            1,
+            "cached after first derivation"
+        );
         // A reboot (boots change) clears the localized caches.
         state.adopt_engine_state(engine_id(), 3, 100, Duration::from_secs(0));
+        assert_eq!(
+            state.priv_key_cache.len(),
+            0,
+            "priv cache invalidated on reboot"
+        );
         let k2 = model.priv_key(&engine_id(), &mut state).unwrap();
         assert_eq!(k1.as_slice(), k2.as_slice(), "derivation is deterministic");
+        assert_eq!(state.priv_key_cache.len(), 1, "re-cached after reboot");
+    }
+
+    // ── review batch: extended-priv guards and cache reuse ─────────────────
+
+    #[test]
+    fn extended_priv_key_requires_auth_protocol() {
+        // Port of test_v3_crypto_parity.py:357 — derivation without an auth
+        // protocol must raise (RFC 3414 requires auth for priv). Construction
+        // stays permissive, matching the reference (usm.py:874, 914, 939).
+        for protocol in [
+            PrivProtocol::Aes192,
+            PrivProtocol::Aes256,
+            PrivProtocol::Des3Ede,
+        ] {
+            let user = UsmUser::new(
+                "simulator".to_string(),
+                AuthProtocol::None_,
+                AuthKey::Passphrase(Vec::new()),
+                protocol,
+                PrivKey::Passphrase(b"privpassword".to_vec()),
+            )
+            .unwrap();
+            let model = UsmModel::new(user, Vec::new(), None, clock(), rng());
+            model.adopt_engine_state(engine_id(), 2, 500);
+            let err = model.wrap_pdu(&get_pdu()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Cannot derive priv key without an auth protocol"),
+                "{protocol:?}: {err}"
+            );
+            // Same guard for a Localized priv key (no extension-loop risk).
+            let localized = UsmUser::new(
+                "simulator".to_string(),
+                AuthProtocol::None_,
+                AuthKey::Passphrase(Vec::new()),
+                protocol,
+                PrivKey::Localized(Zeroizing::new(vec![0x11; 32])),
+            )
+            .unwrap();
+            let model = UsmModel::new(localized, Vec::new(), None, clock(), rng());
+            model.adopt_engine_state(engine_id(), 2, 500);
+            let err = model.wrap_pdu(&get_pdu()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Cannot derive priv key without an auth protocol"),
+                "{protocol:?} Localized: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_priv_kdf_caches_reuse_across_wraps() {
+        // Port of test_v3_crypto_parity.py:566 — repeated wraps reuse the
+        // cached localized priv key (the KDF runs once per engine).
+        let model = priv_discovered(AuthProtocol::Sha256, PrivProtocol::Aes256);
+        for _ in 0..3 {
+            model.wrap_pdu(&get_pdu()).unwrap();
+        }
+        let state = model.state.lock().unwrap();
+        assert_eq!(
+            state.priv_key_cache.len(),
+            1,
+            "priv KDF cached across wraps"
+        );
     }
 }

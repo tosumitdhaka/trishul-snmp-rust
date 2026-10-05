@@ -10,6 +10,9 @@
 //! `_decode_oid`) are exercised through the public surfaces that use them.
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+
+mod common;
 
 use proptest::prelude::*;
 
@@ -20,6 +23,9 @@ use trishul_snmp::codec::v3::{
     locate_auth_params,
 };
 use trishul_snmp::codec::{decode_value, encode_value};
+use trishul_snmp::security::usm::kdf::{AuthProtocol, PrivProtocol};
+use trishul_snmp::security::usm::privacy::{aes_cfb_decrypt, tripledes_decrypt, tripledes_encrypt};
+use trishul_snmp::security::usm::{AuthKey, PrivKey, UsmModel, UsmUser};
 use trishul_snmp::types::oid::Oid;
 use trishul_snmp::types::value::SnmpValue;
 use trishul_snmp::types::varbind::VarBind;
@@ -273,4 +279,72 @@ fn decode_value_rejects_length_claim_beyond_payload() {
     // Public-surface version of the internal decode_tlv boundary test: an
     // OCTET STRING claims 16 content bytes but only 1 is present.
     assert!(decode_value(&[0x04, 0x83, 0x00, 0x00, 0x10, 0xAA]).is_err());
+}
+
+proptest! {
+    #[test]
+    fn tripledes_decrypt_never_panics_on_arbitrary_ciphertext(
+        data in prop::collection::vec(any::<u8>(), 0..300),
+        salt in any::<[u8; 8]>(),
+    ) {
+        // Review item 10: ciphertext length/content is attacker-controlled
+        // (wire msgData); unaligned/empty must be typed errors, aligned
+        // garbage must decrypt without panicking.
+        let material = [0x11u8; 32];
+        let _ = tripledes_decrypt(&material, &data, &salt);
+    }
+
+    #[test]
+    fn aes_cfb_decrypt_never_panics_on_arbitrary_ciphertext(
+        data in prop::collection::vec(any::<u8>(), 0..300),
+        salt in any::<[u8; 8]>(),
+    ) {
+        let key = [0x42u8; 16];
+        let _ = aes_cfb_decrypt(&key, &data, 1, 2, &salt, 16);
+    }
+
+    #[test]
+    fn v3_usm_unwrap_never_panics_on_arbitrary_datagrams(
+        data in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        // Full typed path (authNoPriv model): arbitrary datagrams always
+        // produce a typed UnwrapOutcome, never a panic.
+        let model = usm_unwrap_model();
+        let _ = model.unwrap_message(&data);
+    }
+}
+
+/// A noAuth UsmModel with pre-adopted peer state for the unwrap property.
+fn usm_unwrap_model() -> UsmModel {
+    let user = UsmUser::new(
+        "simulator".to_string(),
+        AuthProtocol::Sha256,
+        AuthKey::Passphrase(b"authpassword12345".to_vec()),
+        PrivProtocol::Des3Ede,
+        PrivKey::Passphrase(b"privpassword12345".to_vec()),
+    )
+    .unwrap();
+    let model = UsmModel::new(
+        user,
+        Vec::new(),
+        None,
+        Arc::new(trishul_snmp::time::SystemClock),
+        Arc::new(common::fake::CounterRng::new(7)),
+    );
+    model.adopt_engine_state(vec![0x80, 0, 0, 0x01], 2, 500);
+    model
+}
+
+/// Every truncation of a valid 3DES authPriv ciphertext decrypts without
+/// panicking (typed errors only) — the B1 class at message level.
+#[test]
+fn tripledes_truncated_valid_ciphertext_never_panics() {
+    let material = [0x11u8; 32];
+    let salt = [0x22u8; 8];
+    let mut plaintext = vec![0x30, 15];
+    plaintext.extend_from_slice(b"scoped pdu body");
+    let ct = tripledes_encrypt(&material, &plaintext, &salt).unwrap();
+    for len in 0..ct.len() {
+        let _ = tripledes_decrypt(&material, &ct[..len], &salt);
+    }
 }

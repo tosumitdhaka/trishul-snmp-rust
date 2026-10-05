@@ -59,18 +59,28 @@ pub fn extend_localized_key(
 
 /// Adapts an already-localized priv key to the cipher key length (truncate;
 /// Blumenthal-extend for AES-192/256). Used for `PrivKey::Localized`.
+///
+/// Rejects the no-auth case: `extend_localized_key` feeds `plain_digest`,
+/// which yields an empty digest for `AuthProtocol::None_`, so an extension
+/// loop would never terminate (review I1). RFC 3414 requires auth for priv —
+/// the reference raises at derivation time (usm.py:874, 914, 939).
 pub fn adapt_localized_key(
     key: &[u8],
     protocol: PrivProtocol,
     auth: AuthProtocol,
-) -> Zeroizing<Vec<u8>> {
-    match protocol {
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if !auth_enabled(auth) {
+        return Err(Error::Protocol(ProtocolError::new(
+            "Cannot derive priv key without an auth protocol",
+        )));
+    }
+    Ok(match protocol {
         PrivProtocol::Aes128 => Zeroizing::new(key[..key.len().min(16)].to_vec()),
         PrivProtocol::Aes192 | PrivProtocol::Aes256 | PrivProtocol::Des3Ede => {
             extend_localized_key(key, priv_key_length(protocol).unwrap_or(32), auth)
         }
         PrivProtocol::None_ => Zeroizing::new(Vec::new()),
-    }
+    })
 }
 
 /// Derives the localized privacy key for a passphrase and protocol
@@ -307,14 +317,24 @@ pub fn tripledes_decrypt(
     ciphertext: &[u8],
     salt: &[u8; 8],
 ) -> Result<Vec<u8>, Error> {
-    let des_key: [u8; 24] = key_material[..24]
-        .try_into()
-        .map_err(|_| Error::Protocol(ProtocolError::new("3DES key material truncated")))?;
+    // Review B1: ciphertext length is attacker-controlled via the wire
+    // msgData; unaligned slices would panic the block loop, so reject them.
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(8) {
+        return Err(Error::Protocol(ProtocolError::new(format!(
+            "3DES-EDE ciphertext must be a non-empty multiple of 8 octets, got {}",
+            ciphertext.len()
+        ))));
+    }
+    let des_key: Zeroizing<[u8; 24]> = Zeroizing::new(
+        key_material[..24]
+            .try_into()
+            .map_err(|_| Error::Protocol(ProtocolError::new("3DES key material truncated")))?,
+    );
     let iv = xor8(&key_material[24..32], salt);
-    let padded = cbc_ede_decrypt(&des_key, &iv, ciphertext);
+    let padded: Zeroizing<Vec<u8>> = Zeroizing::new(cbc_ede_decrypt(&des_key, &iv, ciphertext));
     match ber_extent(&padded) {
         Some(extent) if extent <= padded.len() => Ok(padded[..extent].to_vec()),
-        _ => Ok(padded),
+        _ => Ok(padded.to_vec()),
     }
 }
 
@@ -334,7 +354,10 @@ pub fn ber_extent(data: &[u8]) -> Option<usize> {
         return None;
     }
     let (length, content_offset) = crate::codec::decode_length(data, 1).ok()?;
-    Some(content_offset + length)
+    // Saturating: decode_length's u64 parse can yield usize::MAX from
+    // 8×0xFF length octets in decrypted garbage; the caller's
+    // `extent <= len` guard then handles it (review I8).
+    Some(content_offset.saturating_add(length))
 }
 
 /// Dispatch: encrypt `plaintext` (a ScopedPDU) under `protocol`; returns the
@@ -384,6 +407,10 @@ pub fn decrypt_for_protocol(
         ))));
     }
     let (tag, ciphertext, end) = crate::codec::decode_tlv(msg_data, 0)?;
+    // Stricter than the reference (usm.py ignores any trailing bytes after
+    // the encryptedPDU TLV). This branch is unreachable through decode_v3_message,
+    // which consumes exactly the msgData field — kept as defence-in-depth for
+    // direct callers (review N4).
     if end != msg_data.len() {
         return Err(Error::Protocol(ProtocolError::new(
             "Unexpected trailing BER content after encryptedPDU",
@@ -451,5 +478,59 @@ mod tests {
         assert_eq!(ber_extent(&data), Some(data.len()));
         assert_eq!(ber_extent(b""), None);
         assert_eq!(ber_extent(&[0x30]), None);
+    }
+
+    #[test]
+    fn tripledes_decrypt_rejects_unaligned_and_empty_ciphertext() {
+        // Review B1: ciphertext length is attacker-controlled; these must be
+        // Err, never a panic from the block loop.
+        let material = [0x11u8; 32];
+        let salt = [0x22u8; 8];
+        for bad in [&[][..], &[0x01u8], &[0x30, 0x05, 0x00], &[0xaa; 17]] {
+            let err = tripledes_decrypt(&material, bad, &salt).unwrap_err();
+            assert!(
+                err.to_string().contains("multiple of 8 octets"),
+                "bad len {}: {err}",
+                bad.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ber_extent_saturates_on_maximal_length_octets() {
+        // Review I8: a long-form length of 8×0xFF must saturate, not overflow
+        // (the caller's `extent <= len` guard then keeps the padded bytes).
+        let garbage = [0x30u8, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(ber_extent(&garbage), Some(usize::MAX));
+        let material = [0x11u8; 32];
+        let salt = [0x22u8; 8];
+        let ct = tripledes_encrypt(&material, &garbage, &salt).unwrap();
+        // Round-trips without panicking; the extent guard keeps the bytes.
+        let pt = tripledes_decrypt(&material, &ct, &salt).unwrap();
+        assert!(!pt.is_empty());
+    }
+
+    #[test]
+    fn nist_sp800_38a_cfb128_kat() {
+        // Review I7: NIST SP 800-38A F.2.1 CFB128 vector for AES-128
+        // (verified against the published standard, not the reviewer's
+        // transcription alone).
+        let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        let salt: [u8; 8] = hex("08090a0b0c0d0e0f").try_into().unwrap();
+        let plaintext = hex("6bc1bee22e409f96e93d7e117393172a");
+        let expected = hex("3b3fd92eb72dad20333449f8e83cfb4a");
+        // IV for the vector is 000102030405060708090a0b0c0d0e0f; our IV is
+        // boots(4)||time(4)||salt(8), so boots=0x00010203, time=0x04050607.
+        let ct = aes_cfb_encrypt(&key, &plaintext, 0x0001_0203, 0x0405_0607, &salt, 16).unwrap();
+        assert_eq!(ct, expected, "SP 800-38A F.2.1 CFB128 ciphertext");
+        let pt = aes_cfb_decrypt(&key, &ct, 0x0001_0203, 0x0405_0607, &salt, 16).unwrap();
+        assert_eq!(pt, plaintext, "SP 800-38A F.2.1 round-trip");
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }
