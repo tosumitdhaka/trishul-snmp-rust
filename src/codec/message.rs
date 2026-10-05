@@ -57,6 +57,12 @@ struct RawMessage {
 
 /// Encodes a v1/v2c message to BER bytes (← message.py:encode_message).
 pub fn encode_message(message: &SnmpMessage) -> Result<Vec<u8>, ProtocolError> {
+    if message.version == SnmpVersion::V3 {
+        // v3 messages use the codec::v3 envelope; SnmpMessage is v1/v2c only.
+        return Err(ProtocolError::new(
+            "SNMPv3 messages use the codec::v3 envelope, not SnmpMessage",
+        ));
+    }
     let raw = RawMessage {
         version: message.version.to_wire(),
         community: OctetString::from(message.community.clone()),

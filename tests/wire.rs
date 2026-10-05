@@ -910,3 +910,21 @@ fn v3_message_auth_params_offset_non_canonical_length() {
     let offset = locate_auth_params(&non_canonical).unwrap();
     assert_eq!(&non_canonical[offset..offset + sentinel.len()], &sentinel);
 }
+
+// ── v3 envelope invariant (review batch) ────────────────────────────────────
+
+#[test]
+fn encode_message_rejects_v3_version() {
+    // SnmpVersion::V3 is a flavor tag for the manager/notifier; the wire
+    // envelope for v3 is codec::v3, so SnmpMessage must reject it.
+    let message = SnmpMessage {
+        version: SnmpVersion::V3,
+        community: b"public".to_vec(),
+        pdu: get_pdu(7),
+    };
+    let err = encode_message(&message).unwrap_err();
+    assert!(
+        err.message.contains("codec::v3 envelope"),
+        "unexpected message: {err}"
+    );
+}

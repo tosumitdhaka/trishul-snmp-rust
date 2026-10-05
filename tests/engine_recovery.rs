@@ -9,6 +9,8 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::agent::{build_recovery_report, usm_agent_model};
@@ -18,6 +20,8 @@ use trishul_snmp::codec::message::SnmpVersion;
 use trishul_snmp::codec::pdu::{Pdu, PduKind};
 use trishul_snmp::error::Error;
 use trishul_snmp::manager::Manager;
+use trishul_snmp::manager::walk::WalkOptions;
+use trishul_snmp::notify::sender::Notifier;
 use trishul_snmp::security::SecurityModel;
 use trishul_snmp::security::usm::kdf::{AuthProtocol, PrivProtocol};
 use trishul_snmp::security::usm::{AuthKey, PrivKey, UsmModel, UsmUser};
@@ -248,4 +252,241 @@ async fn recovery_adopts_engine_state_from_report() {
 fn helper_surface_compiles() {
     let _ = SnmpVersion::V3;
     let _: Vec<u8> = ENGINE_ID.to_vec();
+}
+
+// ── walk / notifier recovery (review batch) ─────────────────────────────────
+
+/// A v3 GETNEXT/GETBULK response echoing the request id and returning the
+/// next table object after the requested OID (EoMv past the end).
+fn v3_next_response_for(request: &[u8], model: &UsmModel, objects: &[(Oid, SnmpValue)]) -> Vec<u8> {
+    let view = trishul_snmp::codec::v3::decode_v3_message(request).unwrap();
+    let (_eid, _ctx, pdu) =
+        trishul_snmp::codec::v3::decode_scoped_pdu(&view.msg_data_bytes).unwrap();
+    let requested = pdu
+        .varbinds
+        .first()
+        .map(|v| v.oid.clone())
+        .unwrap_or_else(|| Oid::from_arcs(&[0, 0]).unwrap());
+    let varbind = match objects.iter().find(|(oid, _)| *oid > requested) {
+        Some((oid, value)) => VarBind::new(oid.clone(), value.clone()),
+        None => VarBind::new(requested, SnmpValue::EndOfMibView),
+    };
+    let response = Pdu {
+        kind: PduKind::Response,
+        request_id: pdu.request_id,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![varbind],
+        v1_trap: None,
+    };
+    model.wrap_pdu(&response).unwrap()
+}
+
+/// A v3 notifier built over an in-memory transport (peer state discovered).
+fn notifier_over(transport: Arc<FakeTransport>) -> Notifier {
+    let model = discovered_model("simulator");
+    let security = Arc::new(SecurityModel::Usm(model));
+    let dispatcher = RequestDispatcher::new(
+        upcast(Arc::clone(&transport)),
+        Arc::clone(&security),
+        Duration::from_millis(200),
+        0,
+        Arc::new(common::fake::CounterRng::new(7)),
+    )
+    .unwrap();
+    let session = SnmpSession::from_parts(security, upcast(transport), dispatcher);
+    Notifier {
+        session,
+        version: SnmpVersion::V3,
+    }
+}
+
+#[tokio::test]
+async fn walk_recovers_from_report_and_continues() {
+    // The first GETNEXT draws a notInTimeWindows REPORT; the walk retries that
+    // exchange exactly once and then walks the table to completion.
+    let agent = agent_model();
+    let objects = vec![
+        (
+            Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 99999, 1]).unwrap(),
+            SnmpValue::Integer(1),
+        ),
+        (
+            Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 99999, 2]).unwrap(),
+            SnmpValue::Integer(2),
+        ),
+        (
+            Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 99999, 3]).unwrap(),
+            SnmpValue::Integer(3),
+        ),
+    ];
+    let report = build_recovery_report(&ENGINE_ID, 2, 100, b"simulator");
+    let sends = Arc::new(AtomicUsize::new(0));
+    let requested: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let transport = FakeTransport::new({
+        let agent = Arc::clone(&agent);
+        let report = report.clone();
+        let objects = objects.clone();
+        let sends = Arc::clone(&sends);
+        let requested = Arc::clone(&requested);
+        move |request| {
+            sends.fetch_add(1, Ordering::SeqCst);
+            let view = trishul_snmp::codec::v3::decode_v3_message(request).unwrap();
+            let (_eid, _ctx, pdu) =
+                trishul_snmp::codec::v3::decode_scoped_pdu(&view.msg_data_bytes).unwrap();
+            requested
+                .lock()
+                .unwrap()
+                .push(pdu.varbinds[0].oid.display());
+            if sends.load(Ordering::SeqCst) == 1 {
+                vec![report.clone()]
+            } else {
+                vec![v3_next_response_for(request, &agent, &objects)]
+            }
+        }
+    });
+    let manager = manager_over(transport);
+    let walked = manager
+        .walk(
+            &[1, 3, 6, 1, 4, 1, 99999][..],
+            WalkOptions {
+                bulk: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        walked.iter().map(|v| v.oid.display()).collect::<Vec<_>>(),
+        vec![
+            "1.3.6.1.4.1.99999.1".to_string(),
+            "1.3.6.1.4.1.99999.2".to_string(),
+            "1.3.6.1.4.1.99999.3".to_string(),
+        ]
+    );
+    // Exactly one retried exchange: root requested twice, then A, B, C.
+    assert_eq!(sends.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        *requested.lock().unwrap(),
+        vec![
+            "1.3.6.1.4.1.99999".to_string(),
+            "1.3.6.1.4.1.99999".to_string(),
+            "1.3.6.1.4.1.99999.1".to_string(),
+            "1.3.6.1.4.1.99999.2".to_string(),
+            "1.3.6.1.4.1.99999.3".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn v3notifier_send_inform_retries_immediately_on_report_error() {
+    // The first inform exchange draws a REPORT; send_inform re-issues once and
+    // returns the retried exchange's response (notify/client.py:307–322).
+    let agent = agent_model();
+    let report = build_recovery_report(&ENGINE_ID, 2, 100, b"simulator");
+    let sends = Arc::new(AtomicUsize::new(0));
+    let request_ids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let transport = FakeTransport::new({
+        let agent = Arc::clone(&agent);
+        let report = report.clone();
+        let sends = Arc::clone(&sends);
+        let request_ids = Arc::clone(&request_ids);
+        move |request| {
+            sends.fetch_add(1, Ordering::SeqCst);
+            let view = trishul_snmp::codec::v3::decode_v3_message(request).unwrap();
+            let (_eid, _ctx, pdu) =
+                trishul_snmp::codec::v3::decode_scoped_pdu(&view.msg_data_bytes).unwrap();
+            request_ids.lock().unwrap().push(pdu.request_id);
+            if sends.load(Ordering::SeqCst) == 1 {
+                vec![report.clone()]
+            } else {
+                vec![v3_response_for(request, &agent)]
+            }
+        }
+    });
+    let notifier = notifier_over(transport);
+    let response = notifier
+        .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap();
+    assert_eq!(sends.load(Ordering::SeqCst), 2);
+    // The response corresponds to the retried (second) exchange.
+    let ids = request_ids.lock().unwrap();
+    assert_eq!(response.request_id, ids[1]);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[tokio::test]
+async fn v3notifier_send_inform_unrelated_errors_propagate_without_retry() {
+    // Re-spec of test_engine_recovery.py:243–263: the typed dispatcher only
+    // surfaces EngineRecovery after the model adopted the REPORT, so a
+    // "flagless recovery error" is unrepresentable. The equivalent guarantee
+    // is that unrelated errors (e.g. timeout) propagate unchanged — no retry.
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport = FakeTransport::new({
+        let sends = Arc::clone(&sends);
+        move |_| {
+            sends.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+    });
+    let notifier = notifier_over(transport);
+    let err = notifier
+        .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Timeout { .. }), "got {err:?}");
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn v3notifier_send_inform_second_report_clears_flag_and_propagates() {
+    // Both exchanges draw a REPORT: the first is retried once, the second
+    // propagates and the residual recovery flag is cleared (no loop).
+    let report = build_recovery_report(&ENGINE_ID, 2, 100, b"simulator");
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport = FakeTransport::new({
+        let report = report.clone();
+        let sends = Arc::clone(&sends);
+        move |_| {
+            sends.fetch_add(1, Ordering::SeqCst);
+            vec![report.clone()]
+        }
+    });
+    let notifier = notifier_over(transport);
+    let err = notifier
+        .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::EngineRecovery(_)), "got {err:?}");
+    assert_eq!(sends.load(Ordering::SeqCst), 2);
+    // The retry path cleared the residual flag.
+    assert!(notifier.session.security.take_recovery().is_none());
+}
+
+#[tokio::test]
+async fn v3notifier_send_inform_recovers_via_report_without_timeout() {
+    // End-to-end: the REPORT surfaces immediately and the retried inform
+    // completes — no timeout on the recovery path.
+    let agent = agent_model();
+    let report = build_recovery_report(&ENGINE_ID, 2, 100, b"simulator");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let transport = FakeTransport::new({
+        let agent = Arc::clone(&agent);
+        let report = report.clone();
+        let calls = Arc::clone(&calls);
+        move |request| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![report.clone()]
+            } else {
+                vec![v3_response_for(request, &agent)]
+            }
+        }
+    });
+    let notifier = notifier_over(transport);
+    let response = notifier
+        .send_inform("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap();
+    assert!(response.error_status == trishul_snmp::types::varbind::ErrorStatus::NoError);
 }

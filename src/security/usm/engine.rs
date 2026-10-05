@@ -28,12 +28,47 @@ pub struct UsmLocalEngine {
     pub engine_time: u32,
 }
 
-/// Bounded LRU of derived keys keyed by a byte tuple
-/// (usm.py:_LocalizedKeyCache).
+/// Length-prefixed key-material wrapper usable as a HashMap key. The prefix
+/// removes the ambiguity of variable-length engineID‖passphrase concatenations
+/// (review NIT 11) and the payload is `Zeroizing` on drop.
+#[derive(Clone)]
+pub(crate) struct KeyMaterial(Zeroizing<Vec<u8>>);
+
+impl KeyMaterial {
+    /// Builds the key from length-prefixed parts (`[len][part]…`).
+    pub(crate) fn new(parts: &[&[u8]]) -> Self {
+        let mut key = Vec::new();
+        for part in parts {
+            key.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            key.extend_from_slice(part);
+        }
+        Self(Zeroizing::new(key))
+    }
+}
+
+impl PartialEq for KeyMaterial {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_slice() == other.0.as_slice()
+    }
+}
+impl Eq for KeyMaterial {}
+impl std::hash::Hash for KeyMaterial {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_slice().hash(state);
+    }
+}
+
+impl std::fmt::Debug for KeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyMaterial(<redacted>)")
+    }
+}
+
+/// Bounded LRU of derived keys keyed by [`KeyMaterial`] (usm.py:_LocalizedKeyCache).
 #[derive(Clone)]
 pub(crate) struct KeyCache {
-    entries: HashMap<Vec<u8>, Zeroizing<Vec<u8>>>,
-    order: VecDeque<Vec<u8>>,
+    entries: HashMap<KeyMaterial, Zeroizing<Vec<u8>>>,
+    order: VecDeque<KeyMaterial>,
     capacity: usize,
 }
 
@@ -52,11 +87,20 @@ impl KeyCache {
         }
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    /// Looks up a key, touching recency (real LRU, usm.py:154–158 `move_to_end`).
+    pub(crate) fn get(&mut self, key: &KeyMaterial) -> Option<Zeroizing<Vec<u8>>> {
+        if !self.entries.contains_key(key) {
+            return None;
+        }
+        if let Some(position) = self.order.iter().position(|k| k == key)
+            && let Some(recent) = self.order.remove(position)
+        {
+            self.order.push_back(recent);
+        }
         self.entries.get(key).cloned()
     }
 
-    pub(crate) fn set(&mut self, key: Vec<u8>, value: Zeroizing<Vec<u8>>) {
+    pub(crate) fn set(&mut self, key: KeyMaterial, value: Zeroizing<Vec<u8>>) {
         if !self.entries.contains_key(&key) {
             self.order.push_back(key.clone());
             if self.order.len() > self.capacity
@@ -101,7 +145,7 @@ pub(crate) struct UsmEngineState {
     /// The stashed recovery report awaiting `take_recovery`.
     pub(crate) recovery_report: Option<crate::error::EngineReport>,
     /// Per-(protocol, password) engine-independent Ku cache.
-    pub(crate) ku_cache: HashMap<(AuthProtocol, Vec<u8>), Zeroizing<Vec<u8>>>,
+    pub(crate) ku_cache: HashMap<(AuthProtocol, KeyMaterial), Zeroizing<Vec<u8>>>,
     /// Bounded LRU of localized auth keys keyed by `engine_id || password`.
     pub(crate) localized_cache: KeyCache,
     /// Message id counter.
@@ -176,13 +220,27 @@ mod tests {
     #[test]
     fn key_cache_evicts_lru_at_capacity() {
         let mut cache = KeyCache::new(2);
-        cache.set(b"a".to_vec(), Zeroizing::new(vec![1]));
-        cache.set(b"b".to_vec(), Zeroizing::new(vec![2]));
-        cache.set(b"c".to_vec(), Zeroizing::new(vec![3]));
+        let a = KeyMaterial::new(&[b"a"]);
+        let b = KeyMaterial::new(&[b"b"]);
+        let c = KeyMaterial::new(&[b"c"]);
+        cache.set(a.clone(), Zeroizing::new(vec![1]));
+        cache.set(b.clone(), Zeroizing::new(vec![2]));
+        // Touch "a" so it becomes most-recently-used.
+        assert!(cache.get(&a).is_some());
+        cache.set(c.clone(), Zeroizing::new(vec![3]));
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(b"a").is_none());
-        assert!(cache.get(b"b").is_some());
-        assert!(cache.get(b"c").is_some());
+        // "b" was least-recently-used when "c" arrived.
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&b).is_none());
+        assert!(cache.get(&c).is_some());
+    }
+
+    #[test]
+    fn key_material_length_prefixes_parts() {
+        // engine_id‖passphrase must not be ambiguous: "ab"+"c" vs "a"+"bc".
+        let one = KeyMaterial::new(&[b"ab", b"c"]);
+        let two = KeyMaterial::new(&[b"a", b"bc"]);
+        assert_ne!(one, two);
     }
 
     #[test]
@@ -193,7 +251,7 @@ mod tests {
         // A reboot (boots change) clears the localized cache.
         state
             .localized_cache
-            .set(b"k".to_vec(), Zeroizing::new(vec![1]));
+            .set(KeyMaterial::new(&[b"k"]), Zeroizing::new(vec![1]));
         state.adopt_engine_state(vec![1, 2], 10, 1, Duration::from_secs(200));
         assert_eq!(state.localized_cache.len(), 0);
     }

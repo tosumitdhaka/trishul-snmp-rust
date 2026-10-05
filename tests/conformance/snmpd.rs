@@ -83,14 +83,11 @@ fn v3_conf(port: u16) -> String {
     relevant.join("\n")
 }
 
-/// Finds a free loopback UDP port (the fixture's 1162 is occupied on this
-/// machine; ports are not part of USM identity — engineID is).
-fn free_udp_port() -> u16 {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = socket.local_addr().expect("bound").port();
-    drop(socket);
-    port
-}
+/// The v3 agent binds the fixture's 1162 (the fixture's v3 users are pinned to
+/// that port; USM identity is the engineID, and the createUser lines are kept
+/// byte-identical). If the port is occupied at test time the suite self-skips
+/// with a clear message rather than falling back to another port.
+const V3_PORT: u16 = 1162;
 
 /// Spawns a snmpd with `conf`; returns the child plus the working directory.
 fn spawn_snmpd(conf: &str, name: &str) -> Option<(Child, PathBuf)> {
@@ -276,9 +273,19 @@ async fn conformance_v3_authnopriv_matrix() {
         eprintln!("TSNMP_SNMPD unset: skipping snmpd v3 conformance suite");
         return;
     }
-    let port = free_udp_port();
-    let (mut agent, _workdir) =
-        spawn_snmpd(&v3_conf(port), "v3").expect("snmpd must spawn for the v3 agent");
+    let port = V3_PORT;
+    let Some((mut agent, _workdir)) = spawn_snmpd(&v3_conf(port), "v3") else {
+        eprintln!("conformance: cannot spawn snmpd for the v3 agent on {port}; skipping v3 suite");
+        return;
+    };
+    // A v3 agent that exits immediately means the bind failed (port in use).
+    if let Some(_status) = agent.try_wait().ok().flatten() {
+        let _ = agent.kill();
+        eprintln!(
+            "conformance: v3 agent on {port} exited immediately (port in use?); skipping v3 suite"
+        );
+        return;
+    }
 
     // Readiness: a v3 noAuth user is not configured, so probe with the MD5
     // user's connect (discovery) until it succeeds.

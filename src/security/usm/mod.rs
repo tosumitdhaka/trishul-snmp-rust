@@ -18,7 +18,7 @@ use crate::codec::v3::{
 };
 use crate::error::{EngineReport, Error, ProtocolError, UnwrapOutcome};
 pub use crate::security::usm::engine::UsmLocalEngine;
-use crate::security::usm::engine::{UsmEngineState, advance_local_engine};
+use crate::security::usm::engine::{KeyMaterial, UsmEngineState, advance_local_engine};
 use crate::security::usm::kdf::{
     AuthProtocol, PrivProtocol, auth_enabled, auth_tag_length, password_to_ku,
 };
@@ -38,7 +38,10 @@ const UNKNOWN_USER_NAMES_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0];
 /// An auth key: either a passphrase to localize (RFC 3414 §2.6) or an
 /// already-localized key of exactly the protocol's digest length
 /// (usm.py:UsmUser.auth_key + auth_key_localized).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is redacted — key material never appears in formatted output
+/// (review NIT 9; see docs/architecture.md §8).
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthKey {
     /// Passphrase; localized at message time (cached per engine).
     Passphrase(Vec<u8>),
@@ -47,7 +50,9 @@ pub enum AuthKey {
 }
 
 /// A privacy key: passphrase or already-localized bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is redacted — key material never appears in formatted output.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PrivKey {
     /// Passphrase; localized at message time.
     Passphrase(Vec<u8>),
@@ -56,7 +61,10 @@ pub enum PrivKey {
 }
 
 /// Construction-validated USM credentials (usm.py:UsmUser; §5.4).
-#[derive(Clone, Debug)]
+///
+/// `Debug` is redacted — passphrases and key material never appear in
+/// formatted output (review NIT 9).
+#[derive(Clone)]
 pub struct UsmUser {
     /// User name.
     pub username: String,
@@ -68,6 +76,36 @@ pub struct UsmUser {
     pub priv_protocol: PrivProtocol,
     /// Privacy key material.
     pub priv_key: PrivKey,
+}
+
+impl std::fmt::Debug for AuthKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passphrase(_) => f.write_str("AuthKey::Passphrase(<redacted>)"),
+            Self::Localized(_) => f.write_str("AuthKey::Localized(<redacted>)"),
+        }
+    }
+}
+
+impl std::fmt::Debug for PrivKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passphrase(_) => f.write_str("PrivKey::Passphrase(<redacted>)"),
+            Self::Localized(_) => f.write_str("PrivKey::Localized(<redacted>)"),
+        }
+    }
+}
+
+impl std::fmt::Debug for UsmUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsmUser")
+            .field("username", &self.username)
+            .field("auth_protocol", &self.auth_protocol)
+            .field("auth_key", &"<redacted>")
+            .field("priv_protocol", &self.priv_protocol)
+            .field("priv_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl UsmUser {
@@ -277,10 +315,12 @@ impl UsmModel {
 
     /// Validates an inbound datagram and extracts the PDU (usm.py:unwrap_message).
     ///
-    /// Malformed v3 datagrams, foreign users/engines, and (Phase 4) encrypted
-    /// messages map to [`UnwrapOutcome::NotForUs`]; HMAC failures map to
-    /// [`UnwrapOutcome::AuthFailed`] (never swallowed); adopted engine-recovery
-    /// reports map to [`UnwrapOutcome::EngineRecoveryPending`].
+    /// Structurally invalid v3 datagrams, foreign users/engines, and (Phase 4)
+    /// encrypted messages map to [`UnwrapOutcome::NotForUs`] — never
+    /// [`UnwrapOutcome::Malformed`], which is community-codec-only (usm.py:
+    /// 347–350, 382–389). HMAC failures map to [`UnwrapOutcome::AuthFailed`]
+    /// (never swallowed); adopted engine-recovery reports map to
+    /// [`UnwrapOutcome::EngineRecoveryPending`].
     pub fn unwrap_message(&self, data: &[u8]) -> UnwrapOutcome {
         let view = match decode_v3_message(data) {
             Ok(view) => view,
@@ -492,17 +532,18 @@ impl UsmModel {
                 if !auth_enabled(protocol) {
                     return Ok(Zeroizing::new(Vec::new()));
                 }
-                let cache_key = [engine_id.to_vec(), passphrase.clone()].concat();
+                // Length-prefixed engine_id‖passphrase key (review NIT 11);
+                // both halves Zeroizing on drop.
+                let cache_key = KeyMaterial::new(&[engine_id, passphrase]);
                 if let Some(cached) = state.localized_cache.get(&cache_key) {
                     return Ok(cached);
                 }
-                let ku = match state.ku_cache.get(&(protocol, passphrase.clone())) {
+                let ku_key = KeyMaterial::new(&[passphrase]);
+                let ku = match state.ku_cache.get(&(protocol, ku_key.clone())) {
                     Some(ku) => ku.clone(),
                     None => {
                         let ku = password_to_ku(passphrase, protocol);
-                        state
-                            .ku_cache
-                            .insert((protocol, passphrase.clone()), ku.clone());
+                        state.ku_cache.insert((protocol, ku_key), ku.clone());
                         ku
                     }
                 };
@@ -590,10 +631,27 @@ fn build_discovery_probe(msg_id: u32) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::pdu::PduKind;
+    use crate::codec::v3::{
+        MSG_FLAG_REPORTABLE, UsmSecurityParameters, encode_scoped_pdu, encode_v3_message,
+    };
     use crate::security::usm::kdf::{auth_localized_key_length, localize_key};
+    use crate::types::value::SnmpValue;
+    use crate::types::varbind::VarBind;
 
     fn clock() -> Arc<dyn Clock> {
         Arc::new(crate::time::SystemClock)
+    }
+
+    fn user_with_key(username: &str, auth: AuthProtocol, auth_key: AuthKey) -> UsmUser {
+        UsmUser::new(
+            username.to_string(),
+            auth,
+            auth_key,
+            PrivProtocol::None_,
+            PrivKey::Passphrase(Vec::new()),
+        )
+        .unwrap()
     }
 
     fn user(username: &str, auth: AuthProtocol) -> UsmUser {
@@ -629,12 +687,15 @@ mod tests {
     }
 
     fn discovered() -> UsmModel {
-        let model = UsmModel::new(
-            user("simulator", AuthProtocol::Sha256),
-            Vec::new(),
-            None,
-            clock(),
-        );
+        discovered_with(AuthProtocol::Sha256)
+    }
+
+    fn fresh_with(auth: AuthProtocol) -> UsmModel {
+        UsmModel::new(user("simulator", auth), Vec::new(), None, clock())
+    }
+
+    fn discovered_with(auth: AuthProtocol) -> UsmModel {
+        let model = UsmModel::new(user("simulator", auth), Vec::new(), None, clock());
         model.adopt_engine_state(engine_id(), 2, 500);
         model
     }
@@ -885,5 +946,164 @@ mod tests {
         model224.adopt_engine_state(engine_id(), 2, 500);
         let raw = model256.wrap_pdu(&get_pdu()).unwrap();
         assert_eq!(model224.unwrap_message(&raw), UnwrapOutcome::AuthFailed);
+    }
+
+    // ── review batch: same-protocol wrong key + discovery failure paths ─────
+
+    #[test]
+    fn sha256_authed_message_rejected_with_wrong_same_protocol_key() {
+        // Port of test_v3_crypto_parity.py:223 — protocol mismatch is not the
+        // only failure mode: a different key under the SAME protocol must also
+        // fail authentication.
+        let model = discovered_with(AuthProtocol::Sha256);
+        let other_key = UsmModel::new(
+            user_with_key(
+                "simulator",
+                AuthProtocol::Sha256,
+                AuthKey::Passphrase(b"a-different-passphrase".to_vec()),
+            ),
+            Vec::new(),
+            None,
+            clock(),
+        );
+        other_key.adopt_engine_state(engine_id(), 2, 500);
+        let raw = model.wrap_pdu(&get_pdu()).unwrap();
+        assert_eq!(other_key.unwrap_message(&raw), UnwrapOutcome::AuthFailed);
+    }
+
+    /// Builds a noAuth REPORT datagram for discovery/recovery parsing.
+    fn discovery_report(engine_id: &[u8], boots: i64, time: i64) -> Vec<u8> {
+        let report = crate::codec::pdu::Pdu {
+            kind: PduKind::Report,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                crate::types::oid::Oid::from_arcs(&[1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0]).unwrap(),
+                SnmpValue::Counter32(1),
+            )],
+            v1_trap: None,
+        };
+        let scoped = encode_scoped_pdu(engine_id, b"", &report).unwrap();
+        let usm = UsmSecurityParameters {
+            engine_id: engine_id.to_vec(),
+            engine_boots: boots,
+            engine_time: time,
+            username: Vec::new(),
+            auth_params: Vec::new(),
+            priv_params: Vec::new(),
+        };
+        encode_v3_message(1, 65507, MSG_FLAG_REPORTABLE, &usm, &scoped).unwrap()
+    }
+
+    #[test]
+    fn parse_discovery_response_accepts_valid_report() {
+        let model = fresh_with(AuthProtocol::None_);
+        let bytes = discovery_report(&[0x80, 0x00, 0x01, 0x02, 0x03], 7, 9876);
+        model.parse_discovery_response(&bytes).unwrap();
+        assert_eq!(model.peer_engine_id(), vec![0x80, 0x00, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn parse_discovery_response_rejects_non_report_pdu() {
+        // Port of test_v3_usm.py:295 — a non-REPORT reply is rejected.
+        let model = fresh_with(AuthProtocol::None_);
+        let engine = vec![0x80, 0x00, 0x01, 0x02, 0x03];
+        let pdu = crate::codec::pdu::Pdu {
+            kind: PduKind::Response,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![],
+            v1_trap: None,
+        };
+        let scoped = encode_scoped_pdu(&engine, b"", &pdu).unwrap();
+        let usm = UsmSecurityParameters {
+            engine_id: engine.clone(),
+            engine_boots: 1,
+            engine_time: 0,
+            username: Vec::new(),
+            auth_params: Vec::new(),
+            priv_params: Vec::new(),
+        };
+        let bytes = encode_v3_message(1, 65507, 0, &usm, &scoped).unwrap();
+        let err = model.parse_discovery_response(&bytes).unwrap_err();
+        assert!(err.to_string().contains("expected REPORT PDU"), "{err}");
+        // No engine state was adopted.
+        assert!(model.peer_engine_id().is_empty());
+    }
+
+    #[test]
+    fn parse_discovery_response_rejects_empty_engine_id() {
+        // Port of test_v3_usm.py:332 — a REPORT with an empty engineID is
+        // rejected (no state adopted).
+        let model = fresh_with(AuthProtocol::None_);
+        let bytes = discovery_report(&[], 1, 0);
+        let err = model.parse_discovery_response(&bytes).unwrap_err();
+        assert!(err.to_string().contains("empty engineID"), "{err}");
+        assert!(model.peer_engine_id().is_empty());
+    }
+
+    #[test]
+    fn parse_discovery_response_rejects_malformed_scoped_pdu() {
+        // Port of test_v3_usm.py:368 (trailing bytes after the REPORT inside
+        // the ScopedPDU) plus an invalid REPORT body.
+        let model = fresh_with(AuthProtocol::None_);
+        let engine = vec![0x80, 0x00, 0x01, 0x02, 0x03];
+        // Corrupt the scoped pdu by appending a trailing NULL inside the
+        // outer SEQUENCE (the reference's exact injection).
+        let clean = encode_scoped_pdu(
+            &engine,
+            b"",
+            &crate::codec::pdu::Pdu {
+                kind: PduKind::Report,
+                request_id: 1,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![],
+                v1_trap: None,
+            },
+        )
+        .unwrap();
+        let (_, clean_content, _) = crate::codec::decode_tlv(&clean, 0).unwrap();
+        let mut corrupted = vec![0x30];
+        corrupted.extend(crate::codec::encode_length(clean_content.len() + 2).unwrap());
+        corrupted.extend_from_slice(clean_content);
+        corrupted.extend_from_slice(&[0x05, 0x00]); // trailing NULL
+        let usm = UsmSecurityParameters {
+            engine_id: engine.clone(),
+            engine_boots: 1,
+            engine_time: 0,
+            username: Vec::new(),
+            auth_params: Vec::new(),
+            priv_params: Vec::new(),
+        };
+        let bytes = encode_v3_message(1, 65507, 0, &usm, &corrupted).unwrap();
+        let err = model.parse_discovery_response(&bytes).unwrap_err();
+        assert!(err.to_string().contains("cannot decode ScopedPDU"), "{err}");
+
+        // A REPORT whose request-id INTEGER has zero-length content.
+        let bad_body = b"\x02\x00\x02\x01\x00\x02\x01\x00\x30\x00";
+        let usm = UsmSecurityParameters {
+            engine_id: engine.clone(),
+            engine_boots: 1,
+            engine_time: 0,
+            username: Vec::new(),
+            auth_params: Vec::new(),
+            priv_params: Vec::new(),
+        };
+        let scoped = crate::codec::encode_tlv(0x30, bad_body).unwrap();
+        let bytes = encode_v3_message(1, 65507, 0, &usm, &scoped).unwrap();
+        let err = model.parse_discovery_response(&bytes).unwrap_err();
+        assert!(err.to_string().contains("cannot decode ScopedPDU"), "{err}");
+    }
+
+    #[test]
+    fn parse_discovery_response_rejects_invalid_response_bytes() {
+        let model = fresh_with(AuthProtocol::None_);
+        let err = model
+            .parse_discovery_response(&[0x00, 0x01, 0x02])
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid response"), "{err}");
     }
 }

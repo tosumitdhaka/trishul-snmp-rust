@@ -6,7 +6,7 @@ pub mod walk;
 use std::sync::Arc;
 
 use crate::codec::message::SnmpVersion;
-use crate::codec::pdu::{PduKind, response_error_status};
+use crate::codec::pdu::{Pdu, PduKind, response_error_status};
 use crate::error::Error;
 use crate::manager::walk::WalkOptions;
 use crate::security::SecurityModel;
@@ -157,12 +157,76 @@ impl Manager {
             Some(count) => (PduKind::GetBulkRequest, count as i32),
             None => (PduKind::GetNextRequest, 0),
         };
+        // Same recovery-retry semantics as request(): a mid-walk
+        // notInTimeWindows REPORT retries once and the walk continues
+        // (client.py:118–169 — walk → get_next/get_bulk → _request).
         let pdu = self
-            .session
-            .dispatcher
-            .send_pdu(kind, varbinds, 0, error_index)
+            .exchange_with_recovery(kind, varbinds, 0, error_index)
             .await?;
         response_from_pdu(pdu)
+    }
+
+    /// Exchanges a single request, retrying exactly once on adopted engine
+    /// recovery (client.py:150–169; §5.4). Shared by the single-exchange path
+    /// (`request`) and the walk primitives (`get_oid`) so a mid-walk
+    /// notInTimeWindows REPORT retries and the walk continues.
+    async fn exchange_with_recovery(
+        &self,
+        kind: PduKind,
+        varbinds: Vec<VarBind>,
+        error_status: i32,
+        error_index: i32,
+    ) -> Result<Pdu, Error> {
+        match self
+            .session
+            .dispatcher
+            .send_pdu(kind, varbinds.clone(), error_status, error_index)
+            .await
+        {
+            Ok(pdu) => Ok(pdu),
+            Err(Error::EngineRecovery(_)) => {
+                // The dispatcher already consumed the recovery report (it is
+                // carried in the error); the model adopted the peer's state,
+                // so retry exactly once. A second REPORT on the retry
+                // propagates — one retry, no loop.
+                match self
+                    .session
+                    .dispatcher
+                    .send_pdu(kind, varbinds, error_status, error_index)
+                    .await
+                {
+                    Ok(pdu) => Ok(pdu),
+                    Err(Error::EngineRecovery(report)) => {
+                        // Clear any residual flag so a later stray datagram
+                        // cannot trigger a spurious recovery (client.py:165–169).
+                        let _ = self.session.security.take_recovery();
+                        Err(Error::EngineRecovery(report))
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Err(timeout @ Error::Timeout { .. }) => {
+                // Risk #14: the reference catches RequestTimeoutError too and
+                // consults the recovery flag before deciding whether to retry.
+                // In the typed flow the dispatcher consumes recoveries
+                // immediately, so this check is normally empty — but a REPORT
+                // adopted just before the deadline expired must still retry
+                // once rather than mis-report a timeout.
+                if self.session.security.take_recovery().is_none() {
+                    return Err(timeout);
+                }
+                match self
+                    .session
+                    .dispatcher
+                    .send_pdu(kind, varbinds, error_status, error_index)
+                    .await
+                {
+                    Ok(pdu) => Ok(pdu),
+                    Err(other) => Err(other),
+                }
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// The shared single-exchange path: normalize targets, build null
@@ -182,56 +246,9 @@ impl Manager {
             .map(|oid| VarBind::new(oid.clone(), SnmpValue::Null))
             .collect();
         let _guard = self.session.request_lock.lock().await;
-        let pdu = match self
-            .session
-            .dispatcher
-            .send_pdu(kind, varbinds.clone(), error_status, error_index)
-            .await
-        {
-            Ok(pdu) => pdu,
-            Err(Error::EngineRecovery(_)) => {
-                // The dispatcher already consumed the recovery report (it is
-                // carried in the error); the model adopted the peer's state,
-                // so retry exactly once (client.py:150–169). A second REPORT
-                // on the retry propagates — one retry, no loop.
-                match self
-                    .session
-                    .dispatcher
-                    .send_pdu(kind, varbinds, error_status, error_index)
-                    .await
-                {
-                    Ok(pdu) => pdu,
-                    Err(Error::EngineRecovery(report)) => {
-                        // Clear any residual flag so a later stray datagram
-                        // cannot trigger a spurious recovery (client.py:165–169).
-                        let _ = self.session.security.take_recovery();
-                        return Err(Error::EngineRecovery(report));
-                    }
-                    Err(other) => return Err(other),
-                }
-            }
-            Err(timeout @ Error::Timeout { .. }) => {
-                // Risk #14: the reference catches RequestTimeoutError too and
-                // consults the recovery flag before deciding whether to retry.
-                // In the typed flow the dispatcher consumes recoveries
-                // immediately, so this check is normally empty — but a REPORT
-                // adopted just before the deadline expired must still retry
-                // once rather than mis-report a timeout.
-                if self.session.security.take_recovery().is_none() {
-                    return Err(timeout);
-                }
-                match self
-                    .session
-                    .dispatcher
-                    .send_pdu(kind, varbinds, error_status, error_index)
-                    .await
-                {
-                    Ok(pdu) => pdu,
-                    Err(other) => return Err(other),
-                }
-            }
-            Err(other) => return Err(other),
-        };
+        let pdu = self
+            .exchange_with_recovery(kind, varbinds, error_status, error_index)
+            .await?;
         response_from_pdu(pdu)
     }
 

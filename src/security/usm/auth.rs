@@ -14,9 +14,11 @@ use crate::security::usm::kdf::{AuthProtocol, auth_enabled, auth_tag_length, hma
 /// comparison; an under-long field lets zeros spill into the following TLV
 /// (framing altered, MAC fails).
 ///
-/// Computes the truncated HMAC tag over `raw`, assuming the auth_params
-/// placeholder is in place at `offset` (usm.py:_compute_auth_tag).
-pub fn compute_auth_tag(raw: &[u8], _offset: usize, key: &[u8], protocol: AuthProtocol) -> Vec<u8> {
+/// Computes the truncated HMAC tag over `raw` (usm.py:_compute_auth_tag).
+///
+/// Callers must zero the auth_params placeholder at the located offset before
+/// calling: the MAC input is the full message as given.
+pub fn compute_auth_tag(raw: &[u8], key: &[u8], protocol: AuthProtocol) -> Vec<u8> {
     let digest = hmac_digest(key, raw, protocol);
     digest[..auth_tag_length(protocol)].to_vec()
 }
@@ -25,7 +27,7 @@ pub fn compute_auth_tag(raw: &[u8], _offset: usize, key: &[u8], protocol: AuthPr
 /// the computed HMAC (usm.py:622–629). Locates the offset itself.
 pub fn stamp_auth(raw: &[u8], key: &[u8], protocol: AuthProtocol) -> Result<Vec<u8>, Error> {
     let offset = locate_auth_params(raw)?;
-    let tag = compute_auth_tag(raw, offset, key, protocol);
+    let tag = compute_auth_tag(raw, key, protocol);
     let tag_len = auth_tag_length(protocol);
     let mut out = raw[..offset].to_vec();
     out.extend_from_slice(&tag);
@@ -47,7 +49,7 @@ pub fn verify_auth(
     }
     let tag_len = auth_tag_length(protocol);
     let zeroed = zero_fill(raw, offset, tag_len);
-    let expected = compute_auth_tag(&zeroed, offset, key, protocol);
+    let expected = compute_auth_tag(&zeroed, key, protocol);
     let received = &received_tag[..received_tag.len().min(tag_len)];
     let matches = expected.len() == received.len() && expected.ct_eq(received).unwrap_u8() == 1;
     if !matches {
@@ -165,34 +167,71 @@ mod tests {
     #[test]
     fn verify_ignores_extra_bytes_of_overlong_field_but_keeps_them_in_mac() {
         // An over-long auth field: extra bytes stay raw in the MAC input, the
-        // comparison uses only the first tag_len bytes.
+        // comparison uses only the first tag_len bytes (usm.py:640–644).
         let protocol = AuthProtocol::Sha256;
         let key = localize_key(b"maplesyrup", &engine_id(), protocol).unwrap();
-        let base = wrapped(protocol);
-        // Append a raw 0x00 to the auth field content by rebuilding with a
-        // longer auth_params and re-encoding.
-        let usm = crate::codec::v3::UsmSecurityParameters {
+        let tag_len = auth_tag_length(protocol);
+        let base_usm = crate::codec::v3::UsmSecurityParameters {
             engine_id: engine_id(),
             engine_boots: 2,
             engine_time: 500,
             username: b"parity".to_vec(),
-            auth_params: vec![0u8; auth_tag_length(protocol) + 1],
+            auth_params: vec![0u8; tag_len + 1],
             priv_params: Vec::new(),
         };
-        let scoped = crate::codec::v3::encode_scoped_pdu(&usm.engine_id, b"", &get_pdu()).unwrap();
-        let overlong = crate::codec::v3::encode_v3_message(
-            1,
-            65507,
-            crate::codec::v3::MSG_FLAG_AUTH | crate::codec::v3::MSG_FLAG_REPORTABLE,
-            &usm,
-            &scoped,
-        )
-        .unwrap();
-        let offset = locate_auth_params(&overlong).unwrap();
-        // MAC over the zeroed message must match the normal-length computation
-        // (the extra byte participates in the input but not the comparison).
-        let tag = compute_auth_tag(&overlong, offset, &key, protocol);
-        assert_eq!(tag.len(), auth_tag_length(protocol));
-        let _ = base;
+        let scoped =
+            crate::codec::v3::encode_scoped_pdu(&base_usm.engine_id, b"", &get_pdu()).unwrap();
+        // Messages whose auth field is tag_len+1 bytes with a varying extra byte.
+        let message = |extra: u8| {
+            let mut auth_params = vec![0u8; tag_len + 1];
+            auth_params[tag_len] = extra;
+            crate::codec::v3::encode_v3_message(
+                1,
+                65507,
+                crate::codec::v3::MSG_FLAG_AUTH | crate::codec::v3::MSG_FLAG_REPORTABLE,
+                &crate::codec::v3::UsmSecurityParameters {
+                    auth_params,
+                    ..base_usm.clone()
+                },
+                &scoped,
+            )
+            .unwrap()
+        };
+        let msg_extra_zero = message(0x00);
+        let msg_extra_one = message(0x01);
+        let offset = locate_auth_params(&msg_extra_zero).unwrap();
+        assert_eq!(locate_auth_params(&msg_extra_one).unwrap(), offset);
+        // Tag computed over the zeroed field — the extra byte is part of the
+        // MAC input.
+        let tag = compute_auth_tag(&msg_extra_zero, &key, protocol);
+        assert_eq!(tag.len(), tag_len);
+        // A legitimate over-long datagram (tag || extra) verifies: only the
+        // first tag_len bytes are compared.
+        let mut signed = msg_extra_zero.clone();
+        signed[offset..offset + tag_len].copy_from_slice(&tag);
+        assert!(
+            verify_auth(
+                &signed,
+                offset,
+                &signed[offset..offset + tag_len + 1],
+                &key,
+                protocol
+            )
+            .is_ok()
+        );
+        // The extra byte is in the MAC input: msg_extra_one with the same tag
+        // fails even though its first tag_len field bytes match exactly.
+        let mut forged = msg_extra_one.clone();
+        forged[offset..offset + tag_len].copy_from_slice(&tag);
+        assert!(
+            verify_auth(
+                &forged,
+                offset,
+                &forged[offset..offset + tag_len + 1],
+                &key,
+                protocol
+            )
+            .is_err()
+        );
     }
 }

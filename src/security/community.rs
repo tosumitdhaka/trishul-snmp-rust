@@ -61,6 +61,12 @@ impl CommunityModel {
     /// part of the identity: an agent answering a v1 request with a v2c
     /// response is not for us (community.py:39–49).
     pub fn new(community: Vec<u8>, version: SnmpVersion) -> Result<Self, ProtocolError> {
+        if version == SnmpVersion::V3 {
+            // A community model is meaningless for v3 (usm.py is the v3 path).
+            return Err(ProtocolError::new(
+                "CommunityModel cannot be constructed for SNMPv3",
+            ));
+        }
         let model = Self { community, version };
         Ok(model)
     }
@@ -106,6 +112,7 @@ impl CommunityModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::message::SnmpVersion;
     use crate::types::oid::Oid;
     use crate::types::value::SnmpValue;
     use crate::types::varbind::VarBind;
@@ -175,5 +182,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(wrapped, direct);
+    }
+
+    #[test]
+    fn rejects_v3_construction() {
+        // SnmpVersion::V3 is the USM path; a community model for v3 is
+        // meaningless (review batch; message.rs has the same invariant).
+        let err = CommunityModel::new(b"public".to_vec(), SnmpVersion::V3).unwrap_err();
+        assert!(
+            err.message.contains("cannot be constructed for SNMPv3"),
+            "{err}"
+        );
     }
 }

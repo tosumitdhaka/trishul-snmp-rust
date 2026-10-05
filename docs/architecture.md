@@ -586,7 +586,8 @@ state, which tokio cannot provide.
 | `BTreeMap` responder source | dict + sorted list + bisect/insort | `range()` gives lexicographic next directly |
 | One `Manager` + version | V1/V2c/V3Manager classes | No inheritance in Rust |
 | `Integer(i64)` bound | unbounded Python int | Manual `Decode` rejects over-width/non-minimal unsigned content exactly as `asn1.py:178–179`; signed INTEGER content longer than 8 octets → Malformed (even when magnitude fits i64) |
-| PDU header INTEGERs decode via rasn i64 path | reference's hand decoder rejects over-width | `request_id`/`error_status`/trap fields accept 9-octet content (decodes to u32::MAX image) where values reject it; no reference test covers; converge in Phase 3 |
+| PDU header INTEGERs decode via rasn i64 path | reference's hand decoder rejects over-width | `request_id`/`error_status`/trap fields accept 9-octet content (decodes to u32::MAX image) where values reject it; no reference test covers — accepted divergence (the promised Phase 3 convergence was not implemented; no reference coverage either way) |
+| Negative engineBoots/engineTime on the wire clamp to 0 on adoption | Python adopts the raw negative value | Rejected as nonsensical state (boots/time are counters); no reference coverage |
 | OctetString display uses `!is_control()` | `isprintable()` | Format/line-separator code points render as text instead of hex; documented in code |
 | Early OID arc rejection in `Oid::from_arcs` | parse accepts large arcs, fails only at encode | Strictly earlier failure point; harmless |
 | Listener `on_error` callback dropped | per-drop callback (listener.py:60) | `drop_counts()` polling replaces it |
