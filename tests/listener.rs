@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -443,7 +444,8 @@ async fn decode_notification_exposes_metadata_without_source_address() {
     })
     .unwrap();
 
-    let event = trishul_snmp::notify::event::decode_notification(&encoded, None, None).unwrap();
+    let event =
+        trishul_snmp::notify::event::decode_notification(&encoded, None, None, None).unwrap();
     assert!(event.source_address.is_none());
     assert_eq!(event.source_host(), None);
     assert_eq!(event.source_port(), None);
@@ -469,8 +471,8 @@ async fn notification_event_helper_rejects_non_notification() {
             v1_trap: None,
         },
     };
-    let err =
-        trishul_snmp::notify::event::notification_event_from_message(&message, None).unwrap_err();
+    let err = trishul_snmp::notify::event::notification_event_from_message(&message, None, None)
+        .unwrap_err();
     assert!(
         err.message.contains("Unsupported notification PDU type"),
         "{err}"
@@ -491,6 +493,7 @@ fn v3_config(
         user,
         context_name: Vec::new(),
         local_engine,
+        bundle: None,
         timeout: Duration::from_secs(1),
         retries: 0,
         clock,
@@ -1220,6 +1223,7 @@ async fn to_dict_is_json_serializable_without_bundle() {
     let event = trishul_snmp::notify::event::notification_event_from_message(
         &message,
         Some("10.0.0.1:12345".parse().unwrap()),
+        None,
     )
     .unwrap();
     let d = event.to_dict();
@@ -1263,7 +1267,7 @@ async fn to_dict_varbind_fields() {
         },
     };
     let event =
-        trishul_snmp::notify::event::notification_event_from_message(&message, None).unwrap();
+        trishul_snmp::notify::event::notification_event_from_message(&message, None, None).unwrap();
     let d = event.to_dict();
 
     assert_eq!(d["source_host"], serde_json::Value::Null);
@@ -1289,7 +1293,7 @@ async fn to_dict_with_no_source_address() {
         },
     };
     let event =
-        trishul_snmp::notify::event::notification_event_from_message(&message, None).unwrap();
+        trishul_snmp::notify::event::notification_event_from_message(&message, None, None).unwrap();
     let d = event.to_dict();
     assert_eq!(d["source_host"], serde_json::Value::Null);
     assert_eq!(d["source_port"], serde_json::Value::Null);
@@ -1325,6 +1329,7 @@ async fn to_dict_v3_fields_are_json_safe() {
         &raw,
         Some("10.0.0.2:40162".parse().unwrap()),
         Some(&user),
+        None,
     )
     .unwrap()
     .to_dict();
@@ -1344,6 +1349,145 @@ async fn to_dict_v3_fields_are_json_safe() {
     assert_eq!(d["authoritative_engine_id"], engine_hex);
     assert_eq!(d["authoritative_engine_boots"], 9);
     assert_eq!(d["authoritative_engine_time"], 321);
+}
+
+// ── Phase 6: bundle-enriched events (deferred from Phase 5) ─────────────────
+
+/// A v2c trap message with the reference's `_make_trap_message` varbinds
+/// (test_notification_to_dict.py:59–77).
+fn trap_message_with_bundle_varbinds() -> SnmpMessage {
+    SnmpMessage {
+        version: SnmpVersion::V2c,
+        community: b"public".to_vec(),
+        pdu: Pdu {
+            kind: PduKind::SnmpV2Trap,
+            request_id: 42,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![
+                VarBind::new(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(123)),
+                VarBind::new(
+                    oid(&[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0]),
+                    SnmpValue::ObjectIdentifier(oid(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 3])),
+                ),
+                VarBind::new(
+                    oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 7]),
+                    SnmpValue::Integer(7),
+                ),
+            ],
+            v1_trap: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn to_dict_includes_notification_metadata_with_bundle() {
+    // Port of test_notification_to_dict.py:104–129 (deferred from Phase 5).
+    let tmp = common::mib::TempDir::new("to_dict_bundle");
+    common::mib::write_json(
+        &tmp.path().join("NOTIF-MIB.json"),
+        &common::mib::notif_mib_payload(),
+    );
+    let bundle = trishul_snmp::mib::load_bundle(tmp.path().join("NOTIF-MIB.json")).unwrap();
+
+    let message = trap_message_with_bundle_varbinds();
+    let event = trishul_snmp::notify::event::notification_event_from_message(
+        &message,
+        Some("192.168.1.1:161".parse().unwrap()),
+        Some(&bundle),
+    )
+    .unwrap();
+    let d = event.to_dict();
+
+    let _ = serde_json::to_string(&d).unwrap();
+    assert_eq!(d["notification_oid"], "1.3.6.1.6.3.1.1.5.3");
+    assert_eq!(d["notification_name"], "NOTIF-MIB::linkDown");
+    assert_eq!(d["notification_description"], "A linkDown notification.");
+    assert_eq!(d["uptime"], 123);
+
+    let bindings = d["member_bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1);
+    let member = &bindings[0];
+    assert_eq!(member["symbolic"], "NOTIF-MIB::ifIndex");
+    assert_eq!(member["oid"], "1.3.6.1.2.1.2.2.1.1.7");
+    assert_eq!(member["value_type"], "integer");
+    assert_eq!(member["value"], "7");
+}
+
+#[tokio::test]
+async fn v2c_listener_receives_symbolic_trap_with_bundle() {
+    // Port of test_notification_listener.py:183–225 (deferred from Phase 5):
+    // a bundle-threaded listener receives an enriched symbolic trap.
+    let tmp = common::mib::TempDir::new("symbolic_trap");
+    common::mib::write_json(
+        &tmp.path().join("NOTIF-MIB.json"),
+        &common::mib::notif_mib_payload(),
+    );
+    let bundle =
+        Arc::new(trishul_snmp::mib::load_bundle(tmp.path().join("NOTIF-MIB.json")).unwrap());
+    let listener = NotificationListener::bind(ListenerConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        communities: Some(vec![b"public".to_vec()]),
+        bundle: Some(Arc::clone(&bundle)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let port = listener.local_addr().port();
+
+    let notifier = trishul_snmp::notify::sender::Notifier::connect_v2c(
+        trishul_snmp::security::community::CommunityConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            community: "public".to_string(),
+            bundle: Some(Arc::clone(&bundle)),
+            timeout: Duration::from_millis(200),
+            retries: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let varbinds = vec![(
+        trishul_snmp::target::Target::from_str("NOTIF-MIB::ifIndex.7").unwrap(),
+        SnmpValue::Integer(7),
+    )];
+    let send_task = tokio::spawn(async move {
+        notifier
+            .send_trap("NOTIF-MIB::linkDown", &varbinds, 55)
+            .await
+            .unwrap()
+    });
+
+    let event = recv_event(&listener).await;
+    send_task.await.unwrap();
+
+    assert_eq!(
+        event.varbinds[2].display_name.as_deref(),
+        Some("NOTIF-MIB::ifIndex.7")
+    );
+    assert_eq!(event.varbinds[2].display_value.as_deref(), Some("7"));
+    assert_eq!(
+        event.notification_name.as_deref(),
+        Some("NOTIF-MIB::linkDown")
+    );
+    assert_eq!(
+        event.notification_description.as_deref(),
+        Some("A linkDown notification.")
+    );
+    assert_eq!(
+        event.notification_oid.as_ref().map(Oid::display).as_deref(),
+        Some("1.3.6.1.6.3.1.1.5.3")
+    );
+    assert_eq!(event.uptime, Some(55));
+    assert_eq!(event.member_bindings.len(), 1);
+    assert_eq!(event.member_bindings[0].symbolic(), "NOTIF-MIB::ifIndex");
+    assert_eq!(
+        event.member_bindings[0].varbind,
+        Some(event.varbinds[2].clone())
+    );
+    drop(listener);
 }
 
 fn hex(bytes: &[u8]) -> String {

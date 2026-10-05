@@ -23,7 +23,7 @@ pub(crate) async fn v1_get_bulk(
     max_repetitions: u32,
 ) -> Result<Response, Error> {
     let targets: Vec<Target> = targets.into_iter().map(Into::into).collect();
-    let oids = normalize_targets(&targets)?;
+    let oids = normalize_targets(&targets, manager.session.bundle.as_deref())?;
     let split = (non_repeaters as usize).min(oids.len());
 
     let mut collected: Vec<VarBind> = Vec::new();

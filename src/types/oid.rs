@@ -98,6 +98,21 @@ impl Oid {
             .collect::<Vec<_>>()
             .join(".")
     }
+
+    /// Builds an empty OID (Phase 6 MIB suffix marker; the reference's
+    /// `OidMatch.suffix` defaults to an empty tuple, registry.py:194–206).
+    pub(crate) fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Builds an OID without arc-shape validation. Internal-only: the MIB
+    /// registry needs arbitrary arc-slice keys (`prefix`/`suffix` markers,
+    /// single-arc prefixes) that Python tuples never validate — Python's
+    /// `parse_oid`/tuple slices accept any non-negative arc sequence
+    /// (registry.py:77–100).
+    pub(crate) fn from_arcs_unchecked(arcs: Vec<u32>) -> Self {
+        Self(arcs)
+    }
 }
 
 impl fmt::Display for Oid {

@@ -350,7 +350,8 @@ async fn v2c_send_trap_releases_request_id_on_send_failure() {
         Arc::new(common::fake::FakeRng::new(&[1, 0, 0, 0])),
     )
     .unwrap();
-    let session = trishul_snmp::session::SnmpSession::from_parts(security, client, dispatcher);
+    let session =
+        trishul_snmp::session::SnmpSession::from_parts(security, client, dispatcher, None);
     let notifier = Notifier {
         session,
         version: SnmpVersion::V2c,

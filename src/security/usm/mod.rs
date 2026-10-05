@@ -19,6 +19,7 @@ use crate::codec::v3::{
     decode_v3_message, encode_scoped_pdu, encode_v3_message,
 };
 use crate::error::{EngineReport, Error, ProtocolError, UnwrapOutcome};
+use crate::mib::MibBundle;
 pub use crate::security::usm::engine::UsmLocalEngine;
 use crate::security::usm::engine::{KeyMaterial, UsmEngineState, advance_local_engine};
 use crate::security::usm::kdf::{
@@ -177,6 +178,8 @@ pub struct V3Config {
     /// Optional sender-authoritative engine for traps; `None` means peer
     /// discovery only.
     pub local_engine: Option<UsmLocalEngine>,
+    /// Optional MIB bundle for symbolic targets and response enrichment.
+    pub bundle: Option<Arc<MibBundle>>,
     /// Per-attempt response timeout.
     pub timeout: Duration,
     /// Retries after the initial attempt.

@@ -85,6 +85,7 @@ impl Notifier {
             host: config.host,
             port: config.port,
             security,
+            bundle: config.bundle,
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
@@ -120,6 +121,7 @@ impl Notifier {
             host: config.host,
             port: config.port,
             security,
+            bundle: config.bundle,
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
@@ -145,8 +147,14 @@ impl Notifier {
                 "send_trap requires a v2c notifier",
             )));
         }
-        let notification_oid = normalize_target(&notification.into())?;
-        let built = build_notification_varbinds(&notification_oid, varbinds, uptime)?;
+        let notification_oid =
+            normalize_target(&notification.into(), self.session.bundle.as_deref())?;
+        let built = build_notification_varbinds(
+            &notification_oid,
+            varbinds,
+            uptime,
+            self.session.bundle.as_deref(),
+        )?;
 
         let _guard = self.session.request_lock.lock().await;
         let request = self
@@ -168,9 +176,12 @@ impl Notifier {
                 "send_v1_trap requires a v1 notifier",
             )));
         }
-        let enterprise = normalize_target(&spec.enterprise)?;
-        let (varbinds, effective_timestamp) =
-            build_v1_notification_varbinds(spec.timestamp, &spec.varbinds)?;
+        let enterprise = normalize_target(&spec.enterprise, self.session.bundle.as_deref())?;
+        let (varbinds, effective_timestamp) = build_v1_notification_varbinds(
+            spec.timestamp,
+            &spec.varbinds,
+            self.session.bundle.as_deref(),
+        )?;
         let pdu = Pdu {
             kind: PduKind::Trap,
             request_id: 0,
@@ -209,8 +220,14 @@ impl Notifier {
                 "SNMPv1 does not support informs",
             )));
         }
-        let notification_oid = normalize_target(&notification.into())?;
-        let built = build_notification_varbinds(&notification_oid, varbinds, uptime)?;
+        let notification_oid =
+            normalize_target(&notification.into(), self.session.bundle.as_deref())?;
+        let built = build_notification_varbinds(
+            &notification_oid,
+            varbinds,
+            uptime,
+            self.session.bundle.as_deref(),
+        )?;
 
         let _guard = self.session.request_lock.lock().await;
         // v3: discover peer engine state lazily on first use
@@ -244,19 +261,20 @@ impl Notifier {
             }
             Err(other) => return Err(other),
         };
-        response_from_pdu(pdu)
+        response_from_pdu(pdu, self.session.bundle.as_deref())
     }
 }
 
-/// Normalizes varbind targets to numeric OIDs (symbolic targets fail without
-/// a bundle in Phase 2). Empty lists are valid — notification varbinds are
-/// optional, unlike manager targets.
+/// Normalizes varbind targets to numeric OIDs (symbolic targets resolve
+/// against the loaded bundle). Empty lists are valid — notification varbinds
+/// are optional, unlike manager targets.
 fn normalize_varbind_targets(
     varbinds: &[(Target, SnmpValue)],
+    bundle: Option<&crate::mib::MibBundle>,
 ) -> Result<Vec<(Oid, SnmpValue)>, Error> {
     let mut out = Vec::with_capacity(varbinds.len());
     for (target, value) in varbinds {
-        let oid = normalize_target(target)?;
+        let oid = normalize_target(target, bundle)?;
         out.push((oid, value.clone()));
     }
     Ok(out)
@@ -278,8 +296,9 @@ pub fn build_notification_varbinds(
     notification_oid: &Oid,
     varbinds: &[(Target, SnmpValue)],
     uptime: u32,
+    bundle: Option<&crate::mib::MibBundle>,
 ) -> Result<Vec<VarBind>, Error> {
-    let normalized = normalize_varbind_targets(varbinds)?;
+    let normalized = normalize_varbind_targets(varbinds, bundle)?;
     let mut sys_uptime = SnmpValue::TimeTicks(uptime);
     let mut trap_oid = SnmpValue::ObjectIdentifier(notification_oid.clone());
     let mut extras: Vec<VarBind> = Vec::new();
@@ -307,8 +326,9 @@ pub fn build_notification_varbinds(
 pub fn build_v1_notification_varbinds(
     timestamp: u32,
     varbinds: &[(Target, SnmpValue)],
+    bundle: Option<&crate::mib::MibBundle>,
 ) -> Result<(Vec<VarBind>, u32), Error> {
-    let normalized = normalize_varbind_targets(varbinds)?;
+    let normalized = normalize_varbind_targets(varbinds, bundle)?;
     let mut sys_uptime = SnmpValue::TimeTicks(timestamp);
     let mut extras: Vec<VarBind> = Vec::new();
     for (oid, value) in normalized {
@@ -354,7 +374,7 @@ mod tests {
                 SnmpValue::Integer(1),
             ),
         ];
-        let built = build_notification_varbinds(&notification, &varbinds, 123).unwrap();
+        let built = build_notification_varbinds(&notification, &varbinds, 123, None).unwrap();
         assert_eq!(built.len(), 4);
         assert_eq!(built[0].oid, sys_uptime_oid());
         assert_eq!(built[0].value, SnmpValue::TimeTicks(123));
@@ -376,7 +396,7 @@ mod tests {
                 SnmpValue::ObjectIdentifier(explicit_trap.clone()),
             ),
         ];
-        let built = build_notification_varbinds(&notification, &varbinds, 123).unwrap();
+        let built = build_notification_varbinds(&notification, &varbinds, 123, None).unwrap();
         assert_eq!(built[0].value, SnmpValue::TimeTicks(999));
         assert_eq!(built[1].value, SnmpValue::ObjectIdentifier(explicit_trap));
         assert_eq!(built.len(), 2);
@@ -387,7 +407,7 @@ mod tests {
         let notification = oid(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]);
         let symbolic = Target::from_str("IF-MIB::ifDescr.1").unwrap();
         let varbinds = vec![(symbolic, SnmpValue::Integer(1))];
-        let err = build_notification_varbinds(&notification, &varbinds, 1).unwrap_err();
+        let err = build_notification_varbinds(&notification, &varbinds, 1, None).unwrap_err();
         assert!(err.to_string().contains("requires a loaded bundle"));
     }
 
@@ -397,7 +417,7 @@ mod tests {
             target(&[1, 3, 6, 1, 2, 1, 1, 3, 0]),
             SnmpValue::TimeTicks(456),
         )];
-        let (built, effective) = build_v1_notification_varbinds(123, &varbinds).unwrap();
+        let (built, effective) = build_v1_notification_varbinds(123, &varbinds, None).unwrap();
         assert_eq!(effective, 456);
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].value, SnmpValue::TimeTicks(456));
@@ -405,7 +425,7 @@ mod tests {
 
     #[test]
     fn build_v1_notification_varbinds_defaults_to_input_timestamp() {
-        let (built, effective) = build_v1_notification_varbinds(123, &[]).unwrap();
+        let (built, effective) = build_v1_notification_varbinds(123, &[], None).unwrap();
         assert_eq!(effective, 123);
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].value, SnmpValue::TimeTicks(123));

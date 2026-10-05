@@ -64,6 +64,11 @@ pub enum BundleError {
 /// Symbolic or numeric translation failure (← `errors.py:TranslationError`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TranslationError {
+    /// A base-class translation failure with a free-form message
+    /// (← `errors.py:TranslationError`, e.g. "Translation target cannot be
+    /// empty").
+    #[error("{0}")]
+    Message(String),
     /// An OID string or path is malformed (← `InvalidOidError`).
     #[error("invalid OID: {0}")]
     InvalidOid(#[from] InvalidOid),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::mib::MibBundle;
 use crate::security::SecurityModel;
 use crate::time::Rng;
 use crate::transport::dispatcher::RequestDispatcher;
@@ -18,6 +19,9 @@ pub struct SessionConfig {
     pub port: u16,
     /// The security model wrapping the session.
     pub security: Arc<SecurityModel>,
+    /// Optional MIB bundle for symbolic translation and enrichment
+    /// (← session.py:SnmpSession.bundle; Phase 6).
+    pub bundle: Option<Arc<MibBundle>>,
     /// Per-attempt response timeout.
     pub timeout: Duration,
     /// Retries after the initial attempt.
@@ -43,6 +47,9 @@ pub struct SessionConfig {
 /// starve other callers. The lock guard must never be held across a wait that
 /// could deadlock a concurrent close; use `Drop` teardown for cancellation.
 pub struct SnmpSession {
+    /// The optional MIB bundle for symbolic translation and enrichment
+    /// (← session.py:SnmpSession.bundle; §5.5).
+    pub bundle: Option<Arc<MibBundle>>,
     /// The security model (shared with the dispatcher; §5.4 ownership).
     pub security: Arc<SecurityModel>,
     /// The underlying transport.
@@ -70,6 +77,7 @@ impl SnmpSession {
             config.security.prepare(&dispatcher).await?;
         }
         Ok(Self {
+            bundle: config.bundle,
             security: config.security,
             client,
             dispatcher,
@@ -83,8 +91,10 @@ impl SnmpSession {
         security: Arc<SecurityModel>,
         client: Arc<dyn UdpTransport>,
         dispatcher: RequestDispatcher,
+        bundle: Option<Arc<MibBundle>>,
     ) -> Self {
         Self {
+            bundle,
             security,
             client,
             dispatcher,

@@ -8,9 +8,8 @@ use crate::types::oid::Oid;
 /// An unresolved target reference: a numeric OID or a `MODULE::symbol[.suffix]`
 /// reference (← _runtime.py:Target; §5.5).
 ///
-/// Symbolic targets resolve against a loaded MIB bundle; bundles are Phase 6,
-/// so a symbolic target without a bundle always fails with
-/// [`TranslationError::UnknownSymbol`].
+/// Symbolic targets resolve against a loaded MIB bundle; without one they
+/// fail with [`TranslationError::UnknownSymbol`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
     /// A numeric dotted OID (`1.3.6.1.2.1.1.3.0`).
@@ -175,9 +174,12 @@ impl From<Vec<u32>> for Target {
 
 /// Resolves a list of targets to numeric OIDs (← _runtime.py:normalize_targets).
 ///
-/// Empty input is rejected; symbolic targets require a bundle (Phase 6), so
-/// they currently fail with `UnknownSymbol`.
-pub fn normalize_targets(targets: &[Target]) -> Result<Vec<Oid>, Error> {
+/// Empty input is rejected. Symbolic targets require a loaded bundle; without
+/// one they fail with `UnknownSymbol` (`_runtime.py:24–38`).
+pub fn normalize_targets(
+    targets: &[Target],
+    bundle: Option<&crate::mib::MibBundle>,
+) -> Result<Vec<Oid>, Error> {
     if targets.is_empty() {
         return Err(Error::InvalidInput(
             "At least one target is required".to_string(),
@@ -198,10 +200,12 @@ pub fn normalize_targets(targets: &[Target]) -> Result<Vec<Oid>, Error> {
                         format!("Unrecognized target format: {symbol}"),
                     )));
                 }
-                // MIB bundles land in Phase 6.
-                return Err(Error::Translation(TranslationError::UnknownSymbol(
-                    format!("Symbolic target requires a loaded bundle: {module}::{symbol}"),
-                )));
+                let Some(bundle) = bundle else {
+                    return Err(Error::Translation(TranslationError::UnknownSymbol(
+                        format!("Symbolic target requires a loaded bundle: {module}::{symbol}"),
+                    )));
+                };
+                oids.push(bundle.resolve(target)?);
             }
         }
     }
@@ -209,8 +213,11 @@ pub fn normalize_targets(targets: &[Target]) -> Result<Vec<Oid>, Error> {
 }
 
 /// Resolves a single target to a numeric OID.
-pub fn normalize_target(target: &Target) -> Result<Oid, Error> {
-    normalize_targets(std::slice::from_ref(target)).map(|mut oids| oids.remove(0))
+pub fn normalize_target(
+    target: &Target,
+    bundle: Option<&crate::mib::MibBundle>,
+) -> Result<Oid, Error> {
+    normalize_targets(std::slice::from_ref(target), bundle).map(|mut oids| oids.remove(0))
 }
 
 #[cfg(test)]
@@ -282,7 +289,7 @@ mod tests {
 
     #[test]
     fn normalize_requires_at_least_one_target() {
-        let err = normalize_targets(&[]).unwrap_err();
+        let err = normalize_targets(&[], None).unwrap_err();
         assert_eq!(
             err,
             Error::InvalidInput("At least one target is required".to_string())
@@ -292,7 +299,7 @@ mod tests {
     #[test]
     fn normalize_rejects_symbolic_without_bundle() {
         let target = Target::from_str("IF-MIB::ifDescr.1").unwrap();
-        let err = normalize_targets(&[target]).unwrap_err();
+        let err = normalize_targets(&[target], None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Symbolic target requires a loaded bundle")
@@ -302,7 +309,7 @@ mod tests {
     #[test]
     fn normalize_rejects_unrecognized_text() {
         let target = Target::from("not-an-oid");
-        let err = normalize_targets(&[target]).unwrap_err();
+        let err = normalize_targets(&[target], None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Unrecognized target format: not-an-oid")
@@ -315,7 +322,7 @@ mod tests {
             Target::from("1.3.6.1.2.1.1.3.0"),
             Target::from("1.3.6.1.2.1.1.5.0"),
         ];
-        let oids = normalize_targets(&targets).unwrap();
+        let oids = normalize_targets(&targets, None).unwrap();
         assert_eq!(oids.len(), 2);
         assert_eq!(
             oids[0],

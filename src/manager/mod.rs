@@ -54,6 +54,7 @@ impl Manager {
             host: config.host,
             port: config.port,
             security,
+            bundle: config.bundle,
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
@@ -118,7 +119,7 @@ impl Manager {
         opts: WalkOptions,
     ) -> Result<Vec<VarBind>, Error> {
         let root = root.into();
-        let root_oid = crate::target::normalize_target(&root)?;
+        let root_oid = crate::target::normalize_target(&root, self.session.bundle.as_deref())?;
         let bulk = self.version != SnmpVersion::V1 && opts.bulk;
         let request_fn = |current: &Oid, max_repetitions: Option<u32>| {
             let this = self;
@@ -163,7 +164,7 @@ impl Manager {
         let pdu = self
             .exchange_with_recovery(kind, varbinds, 0, error_index)
             .await?;
-        response_from_pdu(pdu)
+        response_from_pdu(pdu, self.session.bundle.as_deref())
     }
 
     /// Exchanges a single request, retrying exactly once on adopted engine
@@ -240,7 +241,7 @@ impl Manager {
         error_index: i32,
     ) -> Result<Response, Error> {
         let targets: Vec<Target> = targets.into_iter().map(Into::into).collect();
-        let oids = normalize_targets(&targets)?;
+        let oids = normalize_targets(&targets, self.session.bundle.as_deref())?;
         let varbinds: Vec<VarBind> = oids
             .iter()
             .map(|oid| VarBind::new(oid.clone(), SnmpValue::Null))
@@ -249,7 +250,7 @@ impl Manager {
         let pdu = self
             .exchange_with_recovery(kind, varbinds, error_status, error_index)
             .await?;
-        response_from_pdu(pdu)
+        response_from_pdu(pdu, self.session.bundle.as_deref())
     }
 
     /// Connects a v3 manager (RFC 3414 discovery runs during connect).
@@ -266,6 +267,7 @@ impl Manager {
             host: config.host,
             port: config.port,
             security,
+            bundle: config.bundle,
             timeout: config.timeout,
             retries: config.retries,
             rng: config.rng,
@@ -279,14 +281,18 @@ impl Manager {
     }
 }
 
-/// Converts a raw RESPONSE PDU into the public response model
-/// (← client.py:response_from_pdu).
-pub fn response_from_pdu(pdu: crate::codec::pdu::Pdu) -> Result<Response, Error> {
+/// Converts a raw RESPONSE PDU into the public response model, enriching the
+/// varbinds when a bundle is available (← client.py:response_from_pdu).
+pub fn response_from_pdu(
+    pdu: crate::codec::pdu::Pdu,
+    bundle: Option<&crate::mib::MibBundle>,
+) -> Result<Response, Error> {
     let error_status = response_error_status(pdu.error_status)?;
+    let varbinds = crate::mib::render::enrich_varbinds(bundle, pdu.varbinds);
     Ok(Response {
         request_id: pdu.request_id,
         error_status,
         error_index: pdu.error_index.max(0) as u32,
-        varbinds: pdu.varbinds,
+        varbinds,
     })
 }

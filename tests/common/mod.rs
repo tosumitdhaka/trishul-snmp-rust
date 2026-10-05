@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod fake;
+pub mod mib;
 pub mod notify;
 pub mod transport;
 

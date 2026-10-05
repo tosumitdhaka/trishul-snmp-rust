@@ -78,7 +78,7 @@ fn manager_over(transport: Arc<FakeTransport>) -> Manager {
         Arc::new(common::fake::CounterRng::new(7)),
     )
     .unwrap();
-    let session = SnmpSession::from_parts(security, upcast(transport), dispatcher);
+    let session = SnmpSession::from_parts(security, upcast(transport), dispatcher, None);
     Manager {
         session,
         version: SnmpVersion::V3,
@@ -295,7 +295,7 @@ fn notifier_over(transport: Arc<FakeTransport>) -> Notifier {
         Arc::new(common::fake::CounterRng::new(7)),
     )
     .unwrap();
-    let session = SnmpSession::from_parts(security, upcast(transport), dispatcher);
+    let session = SnmpSession::from_parts(security, upcast(transport), dispatcher, None);
     Notifier {
         session,
         version: SnmpVersion::V3,

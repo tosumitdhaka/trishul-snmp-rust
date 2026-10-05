@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
 use crate::codec::pdu::Pdu;
 use crate::error::{Error, ProtocolError, UnwrapOutcome};
+use crate::mib::MibBundle;
 use crate::time::{Rng, SystemRng};
 
 /// Shared community-security client configuration
@@ -24,6 +25,8 @@ pub struct CommunityConfig {
     pub port: u16,
     /// Community string.
     pub community: String,
+    /// Optional MIB bundle for symbolic targets and response enrichment.
+    pub bundle: Option<Arc<MibBundle>>,
     /// Per-attempt response timeout (default 2s).
     pub timeout: Duration,
     /// Retries after the initial attempt (default 1).
@@ -38,6 +41,7 @@ impl Default for CommunityConfig {
             host: "127.0.0.1".to_string(),
             port: 161,
             community: "public".to_string(),
+            bundle: None,
             timeout: Duration::from_secs(2),
             retries: 1,
             rng: Arc::new(SystemRng),

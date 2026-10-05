@@ -8,8 +8,8 @@
 //! bindings are rendered as the reference's dicts.
 //!
 //! MIB enrichment (`notification_name`, `notification_description`,
-//! `member_bindings`) is populated in Phase 6 when a bundle is supplied;
-//! without a bundle the fields stay `None`/empty, matching the reference.
+//! `member_bindings`) is populated when a bundle is supplied; without a
+//! bundle the fields stay `None`/empty, matching the reference.
 
 use std::net::SocketAddr;
 
@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::codec::message::{SnmpMessage, decode_message};
 use crate::codec::pdu::{Pdu, PduKind};
 use crate::error::{Error, ProtocolError};
+use crate::mib::{MibBundle, MibMemberRef};
 use crate::notify::v3_path::{V3NotificationEnvelope, decode_v3_notification_message};
 use crate::security::usm::{UsmModel, UsmUser};
 use crate::time::{SystemClock, SystemRng};
@@ -42,10 +43,8 @@ pub fn pdu_type_name(kind: PduKind) -> Option<&'static str> {
 }
 
 /// A declared notification member paired with its received varbind
-/// (events.py:33–43).
-///
-/// Phase 6 populates these from a loaded bundle; without a bundle the list is
-/// always empty.
+/// (events.py:33–43). Populated from a loaded bundle; without a bundle the
+/// list is always empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationMemberBinding {
     /// `MODULE::symbol` form of the declared member.
@@ -265,16 +264,19 @@ impl Serialize for NotificationEvent {
 }
 
 /// Converts a low-level v1/v2c notification message into the public event
-/// model (events.py:160–173).
+/// model (events.py:160–173). MIB enrichment (names, member bindings) applies
+/// when a bundle is supplied.
 pub fn notification_event_from_message(
     message: &SnmpMessage,
     source_address: Option<SocketAddr>,
+    bundle: Option<&MibBundle>,
 ) -> Result<NotificationEvent, ProtocolError> {
     notification_event_from_pdu(
         &message.pdu,
         message.pdu.request_id,
         Some(message.community.clone()),
         source_address,
+        bundle,
         None,
         None,
         None,
@@ -291,6 +293,7 @@ pub fn notification_event_from_message(
 pub fn notification_event_from_v3_envelope(
     envelope: &V3NotificationEnvelope,
     source_address: Option<SocketAddr>,
+    bundle: Option<&MibBundle>,
 ) -> Result<NotificationEvent, ProtocolError> {
     // Strict UTF-8, matching the reference's `.decode("utf-8")` (events.py:
     // 190): a non-UTF-8 username raises instead of being lossily replaced.
@@ -303,6 +306,7 @@ pub fn notification_event_from_v3_envelope(
         envelope.pdu.request_id,
         None,
         source_address,
+        bundle,
         Some("3".to_string()),
         Some(username),
         Some(envelope.security_level.clone()),
@@ -318,17 +322,21 @@ pub fn notification_event_from_v3_envelope(
 ///
 /// When `user` is omitted, the SNMPv2c path is used. Supplying `user=...`
 /// switches the function to strict SNMPv3 USM decode with a fresh one-shot
-/// codec. MIB enrichment (the `bundle` parameter of the reference) lands with
-/// Phase 6.
+/// codec.
 pub fn decode_notification(
     data: &[u8],
     source_address: Option<SocketAddr>,
     user: Option<&UsmUser>,
+    bundle: Option<&MibBundle>,
 ) -> Result<NotificationEvent, Error> {
     match user {
         None => {
             let message = decode_message(data)?;
-            Ok(notification_event_from_message(&message, source_address)?)
+            Ok(notification_event_from_message(
+                &message,
+                source_address,
+                bundle,
+            )?)
         }
         Some(user) => {
             let decoded = crate::notify::v3_path::V3DecodedDatagram::decode(data)?;
@@ -343,6 +351,7 @@ pub fn decode_notification(
                 Some(envelope) => Ok(notification_event_from_v3_envelope(
                     &envelope,
                     source_address,
+                    bundle,
                 )?),
                 None => Err(Error::Protocol(ProtocolError::new(
                     "Message is not a valid SNMPv3 trap or inform for the configured user",
@@ -359,6 +368,7 @@ fn notification_event_from_pdu(
     request_id: u32,
     community: Option<Vec<u8>>,
     source_address: Option<SocketAddr>,
+    bundle: Option<&MibBundle>,
     snmp_version: Option<String>,
     username: Option<String>,
     security_level: Option<String>,
@@ -372,18 +382,14 @@ fn notification_event_from_pdu(
         ProtocolError::new(format!("Unsupported notification PDU type: {:?}", pdu.kind))
     })?;
 
-    // Without a bundle the reference still populates display_value (the raw
-    // display string); enrichment in Phase 6 replaces these.
-    let varbinds: Vec<VarBind> = pdu
-        .varbinds
-        .iter()
-        .map(|varbind| VarBind {
-            display_value: Some(varbind.value.to_string()),
-            ..varbind.clone()
-        })
-        .collect();
+    // Enrichment: with a bundle the varbinds carry symbolic names, enum
+    // labels, and units; without one only the raw display string is set
+    // (render.py:19–60).
+    let varbinds = crate::mib::render::enrich_varbinds(bundle, pdu.varbinds.clone());
     let notification_oid = extract_notification_oid(&varbinds);
     let uptime = extract_uptime(&varbinds);
+    let (notification_name, notification_description, member_bindings) =
+        notification_metadata(bundle, notification_oid.as_ref(), &varbinds);
 
     let (enterprise, agent_addr, generic_trap, specific_trap, timestamp) = match pdu.kind {
         PduKind::Trap => {
@@ -409,10 +415,10 @@ fn notification_event_from_pdu(
         pdu_type: pdu_type.to_string(),
         varbinds,
         notification_oid,
-        notification_name: None,
-        notification_description: None,
+        notification_name,
+        notification_description,
         uptime,
-        member_bindings: Vec::new(),
+        member_bindings,
         snmp_version,
         username,
         security_level,
@@ -427,6 +433,82 @@ fn notification_event_from_pdu(
         specific_trap,
         timestamp,
     })
+}
+
+/// Resolves the notification metadata (name, description, member bindings)
+/// from the loaded bundle (events.py:315–341). Without a bundle, or when the
+/// notification OID does not resolve exactly to a `NOTIFICATION-TYPE`, the
+/// name alone (or nothing) is produced.
+fn notification_metadata(
+    bundle: Option<&MibBundle>,
+    notification_oid: Option<&Oid>,
+    varbinds: &[VarBind],
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<NotificationMemberBinding>,
+) {
+    let (Some(bundle), Some(notification_oid)) = (bundle, notification_oid) else {
+        return (None, None, Vec::new());
+    };
+    let match_ = match bundle.lookup(notification_oid) {
+        Ok(match_) => match_,
+        Err(_) => return (None, None, Vec::new()),
+    };
+    if match_.matched_oid != *notification_oid || !match_.suffix.arcs().is_empty() {
+        return (
+            Some(bundle.display_symbolic_from_match(&match_)),
+            None,
+            Vec::new(),
+        );
+    }
+
+    let notification_name = bundle.display_symbolic_from_match(&match_);
+    let notification_node = bundle.resolve_node(&match_.module, &match_.symbol);
+    let Some(node) = notification_node else {
+        return (Some(notification_name), None, Vec::new());
+    };
+    if node.object_type != "NOTIFICATION-TYPE" {
+        return (Some(notification_name), None, Vec::new());
+    }
+    (
+        Some(notification_name),
+        node.description.clone(),
+        build_member_bindings(&node.members, varbinds),
+    )
+}
+
+/// Binds declared notification members to the received payload varbinds
+/// (events.py:348–367). The auto sysUpTime.0 / snmpTrapOID.0 varbinds are
+/// excluded; each declared member binds to the payload varbind at its index
+/// (or `None` when the sender omitted it).
+fn build_member_bindings(
+    declared_members: &Option<Vec<MibMemberRef>>,
+    varbinds: &[VarBind],
+) -> Vec<NotificationMemberBinding> {
+    let Some(declared) = declared_members else {
+        return Vec::new();
+    };
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let payload_varbinds: Vec<&VarBind> = varbinds
+        .iter()
+        .filter(|varbind| {
+            varbind.oid.arcs() != SYS_UPTIME_INSTANCE_OID
+                && varbind.oid.arcs() != SNMP_TRAP_OID_INSTANCE_OID
+        })
+        .collect();
+    declared
+        .iter()
+        .enumerate()
+        .map(|(index, member)| NotificationMemberBinding {
+            symbolic: member.symbolic(),
+            varbind: payload_varbinds
+                .get(index)
+                .map(|varbind| (*varbind).clone()),
+        })
+        .collect()
 }
 
 /// The `snmpTrapOID.0` ObjectIdentifier value, if carried (events.py:298–305).
@@ -548,6 +630,7 @@ mod tests {
         let event = notification_event_from_message(
             &trap_message(),
             Some("10.0.0.1:12345".parse().unwrap()),
+            None,
         )
         .unwrap();
         let d = event.to_dict();
@@ -583,7 +666,7 @@ mod tests {
                 v1_trap: None,
             },
         };
-        let event = notification_event_from_message(&message, None).unwrap();
+        let event = notification_event_from_message(&message, None, None).unwrap();
         let d = event.to_dict();
         assert_eq!(d["source_host"], serde_json::Value::Null);
         assert_eq!(d["source_port"], serde_json::Value::Null);
@@ -593,7 +676,7 @@ mod tests {
 
     #[test]
     fn to_dict_varbind_fields_without_bundle() {
-        let event = notification_event_from_message(&trap_message(), None).unwrap();
+        let event = notification_event_from_message(&trap_message(), None, None).unwrap();
         let d = event.to_dict();
         let uptime_vb = &d["varbinds"][0];
         assert_eq!(uptime_vb["oid"], "1.3.6.1.2.1.1.3.0");
@@ -625,7 +708,7 @@ mod tests {
                 }),
             },
         };
-        let event = notification_event_from_message(&message, None).unwrap();
+        let event = notification_event_from_message(&message, None, None).unwrap();
         assert_eq!(event.pdu_type, "trap");
         let d = event.to_dict();
         assert_eq!(d["enterprise"], "1.3.6.1.4.1.999");
@@ -650,7 +733,7 @@ mod tests {
                 v1_trap: None,
             },
         };
-        let err = notification_event_from_message(&message, None).unwrap_err();
+        let err = notification_event_from_message(&message, None, None).unwrap_err();
         assert!(
             err.message.contains("Unsupported notification PDU type"),
             "{err}"
@@ -670,7 +753,7 @@ mod tests {
             PrivKey::Passphrase(Vec::new()),
         )
         .unwrap();
-        let err = decode_notification(&encoded, None, Some(&user)).unwrap_err();
+        let err = decode_notification(&encoded, None, Some(&user), None).unwrap_err();
         assert!(err.to_string().contains("version 3"), "{err}");
     }
 
@@ -713,7 +796,7 @@ mod tests {
                 v1_trap: None,
             })
             .unwrap();
-        let err = decode_notification(&raw, None, Some(&user)).unwrap_err();
+        let err = decode_notification(&raw, None, Some(&user), None).unwrap_err();
         assert!(err.to_string().contains("configured user"), "{err}");
     }
 }

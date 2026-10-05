@@ -345,8 +345,13 @@ fn decode_notification_v3_builds_public_event() {
         Some(receiver_engine.clone()),
     );
 
-    let event =
-        decode_notification(&raw, Some("127.0.0.1:40162".parse().unwrap()), Some(&user)).unwrap();
+    let event = decode_notification(
+        &raw,
+        Some("127.0.0.1:40162".parse().unwrap()),
+        Some(&user),
+        None,
+    )
+    .unwrap();
     assert_eq!(event.community, None);
     assert_eq!(event.snmp_version.as_deref(), Some("3"));
     assert_eq!(event.username.as_deref(), Some("notifyuser"));
@@ -402,7 +407,7 @@ fn decode_notification_v3_raises_on_bad_hmac() {
     let mut tampered = raw.clone();
     tampered[view.auth_params_offset] ^= 0xFF;
 
-    let err = decode_notification(&tampered, None, Some(&user)).unwrap_err();
+    let err = decode_notification(&tampered, None, Some(&user), None).unwrap_err();
     assert!(matches!(err, Error::Authentication), "{err:?}");
 }
 
@@ -510,7 +515,7 @@ fn decode_notification_with_user_rejects_v2c_message() {
         })
         .unwrap();
 
-    let err = decode_notification(&v2c, None, Some(&user)).unwrap_err();
+    let err = decode_notification(&v2c, None, Some(&user), None).unwrap_err();
     assert!(err.to_string().contains("version 3"), "{err}");
 }
 

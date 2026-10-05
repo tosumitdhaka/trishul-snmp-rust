@@ -656,6 +656,7 @@ fn v3_config(port: u16, user: UsmUser) -> V3Config {
         user,
         context_name: Vec::new(),
         local_engine: None,
+        bundle: None,
         timeout: Duration::from_secs(1),
         retries: 1,
         clock: Arc::new(trishul_snmp::time::SystemClock),

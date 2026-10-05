@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use crate::codec::message::{SnmpMessage, decode_message, encode_message};
 use crate::codec::pdu::{Pdu, PduKind};
 use crate::error::{Error, ProtocolError, TransportError};
+use crate::mib::MibBundle;
 use crate::notify::event::{
     NotificationEvent, notification_event_from_message, notification_event_from_v3_envelope,
 };
@@ -62,6 +63,9 @@ pub struct ListenerConfig {
     /// Community allow-list for the v1/v2c listener; `None` allows every
     /// community. Ignored by the v3 listener.
     pub communities: Option<Vec<Vec<u8>>>,
+    /// Optional MIB bundle enriching events with symbolic names and member
+    /// bindings (← listener.py:SnmpNotificationListener(bundle=…)).
+    pub bundle: Option<Arc<MibBundle>>,
     /// Clock seam for replay windows and the rate-limited drop log (§7).
     pub clock: Arc<dyn Clock>,
     /// UdpServer queue capacity (test seam).
@@ -74,6 +78,7 @@ impl Default for ListenerConfig {
             host: "0.0.0.0".to_string(),
             port: 162,
             communities: None,
+            bundle: None,
             clock: Arc::new(SystemClock),
             queue_capacity: 1024,
         }
@@ -340,6 +345,7 @@ impl ListenerHandle {
         communities: Option<Vec<Vec<u8>>>,
         v3: Option<(UsmUser, UsmLocalEngine)>,
     ) -> Result<Self, Error> {
+        let bundle = config.bundle.clone();
         let server = Arc::new(
             UdpServer::bind_with(
                 &config.host,
@@ -361,6 +367,7 @@ impl ListenerHandle {
                 tokio::spawn(v2c_receive_loop(
                     Arc::clone(&server),
                     communities,
+                    bundle,
                     Arc::clone(&tracker),
                     tx,
                     cancel_rx,
@@ -383,6 +390,7 @@ impl ListenerHandle {
                     guard,
                     anchor,
                     clock: Arc::clone(&config.clock),
+                    bundle,
                     tracker: Arc::clone(&tracker),
                 };
                 tokio::spawn(v3_receive_loop(Arc::clone(&server), ctx, tx, cancel_rx));
@@ -494,6 +502,7 @@ where
 async fn v2c_receive_loop(
     server: Arc<UdpServer>,
     communities: Option<Vec<Vec<u8>>>,
+    bundle: Option<Arc<MibBundle>>,
     tracker: Arc<DropTracker>,
     tx: mpsc::Sender<Result<NotificationEvent, Error>>,
     mut cancel: watch::Receiver<bool>,
@@ -508,7 +517,7 @@ async fn v2c_receive_loop(
             datagram = server.receive() => {
                 let Some(datagram) = datagram else { break; };
                 let outcome = run_isolated(|| {
-                    handle_v2c_datagram(&datagram, &communities, &tracker)
+                    handle_v2c_datagram(&datagram, &communities, &tracker, bundle.as_deref())
                 });
                 match outcome {
                     Ok(V2cOutcome::Event { reply, event }) => {
@@ -549,6 +558,7 @@ fn handle_v2c_datagram(
     datagram: &ReceivedDatagram,
     communities: &Option<Vec<Vec<u8>>>,
     tracker: &DropTracker,
+    bundle: Option<&MibBundle>,
 ) -> Result<V2cOutcome, Error> {
     let message = match tracked_decode_message(&datagram.data) {
         Ok(message) => message,
@@ -585,7 +595,7 @@ fn handle_v2c_datagram(
     } else {
         None
     };
-    let event = notification_event_from_message(&message, Some(datagram.source_address))
+    let event = notification_event_from_message(&message, Some(datagram.source_address), bundle)
         .map_err(Error::Protocol)?;
     Ok(V2cOutcome::Event {
         reply,
@@ -619,6 +629,7 @@ struct V3LoopContext {
     guard: V3ReplayGuard,
     anchor: Duration,
     clock: Arc<dyn Clock>,
+    bundle: Option<Arc<MibBundle>>,
     tracker: Arc<DropTracker>,
 }
 
@@ -778,8 +789,12 @@ fn handle_v3_datagram(
     } else {
         None
     };
-    let event = notification_event_from_v3_envelope(&envelope, Some(datagram.source_address))
-        .map_err(Error::Protocol)?;
+    let event = notification_event_from_v3_envelope(
+        &envelope,
+        Some(datagram.source_address),
+        ctx.bundle.as_deref(),
+    )
+    .map_err(Error::Protocol)?;
     Ok(V3Outcome::Event {
         reply,
         event: Box::new(event),
@@ -1120,7 +1135,7 @@ mod tests {
             data: v2c_message(b"public", 7, PduKind::SnmpV2Trap),
             source_address: "127.0.0.1:40000".parse().unwrap(),
         };
-        match handle_v2c_datagram(&datagram, &None, &tracker).unwrap() {
+        match handle_v2c_datagram(&datagram, &None, &tracker, None).unwrap() {
             V2cOutcome::Event { reply, event } => {
                 assert!(reply.is_none(), "traps get no ack");
                 assert_eq!(event.request_id, 7);
@@ -1137,7 +1152,7 @@ mod tests {
             data: v2c_message(b"public", 7, PduKind::InformRequest),
             source_address: "127.0.0.1:40000".parse().unwrap(),
         };
-        match handle_v2c_datagram(&datagram, &None, &tracker).unwrap() {
+        match handle_v2c_datagram(&datagram, &None, &tracker, None).unwrap() {
             V2cOutcome::Event { reply, event } => {
                 let ack = reply.expect("informs get an ack");
                 let decoded = decode_message(&ack).unwrap();
