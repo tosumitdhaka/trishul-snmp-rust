@@ -175,6 +175,42 @@ async fn bulkwalk_survives_agent_clamping_max_repetitions() {
 }
 
 #[tokio::test]
+async fn bulkwalk_stops_at_end_of_mib_view_in_non_final_position() {
+    // Port of test_walk_quirks.py:225: an endOfMibView before the final
+    // varbind still terminates the walk there.
+    let script = vec![(oid(&ROOT), vec![vb_i(&A, 1), eomv(&A), vb_i(&B, 3)])];
+    let (walked, agent) = walk_scenario(script, vec![], false, true, false, 10).await;
+    assert_eq!(oids(&walked), vec![oid(&A)]);
+    assert_eq!(agent.requested_oids(), vec![oid(&ROOT)]);
+    agent.stop();
+}
+
+#[tokio::test]
+async fn walk_ignores_varbinds_after_leading_end_of_mib_view() {
+    // Port of test_walk_quirks.py:237: data after a leading endOfMibView in
+    // the same response is discarded.
+    let script = vec![(oid(&ROOT), vec![eomv(&A), vb_i(&B, 3)])];
+    let (walked, agent) = walk_scenario(script, vec![], false, true, false, 10).await;
+    assert!(walked.is_empty());
+    assert_eq!(agent.requested_oids(), vec![oid(&ROOT)]);
+    agent.stop();
+}
+
+#[tokio::test]
+async fn bulkwalk_dedupes_repeated_oid_within_response() {
+    // Port of test_walk_quirks.py:303: a duplicated row in one response is
+    // dropped (it equals the just-appended cursor) and the walk continues.
+    let script = vec![
+        (oid(&ROOT), vec![vb_i(&A, 1), vb_i(&A, 2), vb_i(&B, 3)]),
+        (oid(&B), vec![eomv(&B)]),
+    ];
+    let (walked, agent) = walk_scenario(script, vec![], false, true, false, 10).await;
+    assert_eq!(oids(&walked), vec![oid(&A), oid(&B)]);
+    assert_eq!(agent.requested_oids(), vec![oid(&ROOT), oid(&B)]);
+    agent.stop();
+}
+
+#[tokio::test]
 async fn walk_aborts_on_agent_error_status() {
     let script = vec![(oid(&ROOT), vec![vb_i(&A, 1)])];
     let errors = vec![(oid(&A), (5, 2))]; // genErr, error-index 2

@@ -181,6 +181,11 @@ impl Notifier {
         varbinds: &[(Target, SnmpValue)],
         uptime: u32,
     ) -> Result<u32, Error> {
+        if self.version == SnmpVersion::V1 {
+            return Err(Error::Protocol(ProtocolError::new(
+                "send_trap requires a v2c notifier",
+            )));
+        }
         let notification_oid = normalize_target(&notification.into())?;
         let built = build_notification_varbinds(&notification_oid, varbinds, uptime)?;
 

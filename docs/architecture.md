@@ -572,6 +572,7 @@ state, which tokio cannot provide.
 | `connect()` + `Drop` lifecycle | async context manager + manual close | Rust idiom; closes drain machinery |
 | `recv()` listener API | `__aiter__`/`__anext__` | tokio-mpsc idiom |
 | `UsmUser::new -> Result` | panicking `__post_init__` | Rust convention |
+| Datagram size fixed 65535 (`MAX_DATAGRAM_SIZE`) | configurable `max_datagram_size` constructor param | No test or real deployment need; revisit if fragmented transport matters |
 | Typed `UnwrapOutcome` + `EngineRecovery` variant | exception/flag/getattr flow | Locked decision |
 | `BTreeMap` responder source | dict + sorted list + bisect/insort | `range()` gives lexicographic next directly |
 | One `Manager` + version | V1/V2c/V3Manager classes | No inheritance in Rust |

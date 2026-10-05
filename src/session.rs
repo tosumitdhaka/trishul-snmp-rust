@@ -71,11 +71,6 @@ impl SnmpSession {
         })
     }
 
-    /// Closes the underlying transport.
-    pub async fn close(&self) -> Result<(), Error> {
-        self.client.close().await.map_err(Error::Transport)
-    }
-
     /// Builds a session over a caller-supplied transport (test seam; the
     /// transport is not opened here).
     pub fn from_parts(

@@ -22,9 +22,9 @@ const SYSTEM_ROOT: &str = "1.3.6.1.2.1.1";
 const SYS_UPTIME_INSTANCE: &str = "1.3.6.1.2.1.1.3.0";
 const SYS_DESCR_INSTANCE: &str = "1.3.6.1.2.1.1.1.0";
 
-/// Whether the gate is open (TSNMP_SNMPD set).
+/// Whether the gate is open (TSNMP_SNMPD set to exactly "1").
 fn gate_open() -> bool {
-    std::env::var("TSNMP_SNMPD").is_ok()
+    std::env::var("TSNMP_SNMPD").is_ok_and(|value| value == "1")
 }
 
 fn manifest_dir() -> PathBuf {

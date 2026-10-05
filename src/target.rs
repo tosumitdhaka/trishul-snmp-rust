@@ -57,8 +57,11 @@ impl Target {
 /// True when every dotted segment is a non-negative digit run
 /// (← registry.py:103–106).
 fn is_numeric_oid_text(text: &str) -> bool {
-    !text.is_empty()
-        && text
+    // Python parity: leading dots are stripped before the digit-run check
+    // (registry.py:103–105); `Oid::parse` tolerates the leading dot too.
+    let stripped = text.trim_start_matches('.');
+    !stripped.is_empty()
+        && stripped
             .split('.')
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
@@ -257,6 +260,16 @@ mod tests {
     fn rejects_negative_arcs_and_overflow() {
         assert!(Target::from_str("1.3.-1").is_err());
         assert!(Target::from_str("1.3.99999999999").is_err());
+    }
+
+    #[test]
+    fn parses_leading_dot_numeric_targets() {
+        // Python parity: ".1.3.6" is numeric text and parses (registry.py:103).
+        let target = Target::from_str(".1.3.6.1.2.1.1.3.0").unwrap();
+        assert_eq!(
+            target,
+            Target::Numeric(Oid::from_arcs(&[1, 3, 6, 1, 2, 1, 1, 3, 0]).unwrap())
+        );
     }
 
     #[test]

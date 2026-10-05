@@ -417,6 +417,46 @@ async fn dispatcher_wrong_community_response_is_skipped() {
 }
 
 #[tokio::test]
+async fn dispatcher_send_prepared_request_releases_id_on_cancellation() {
+    // Port of test_dispatcher.py:test_dispatcher_send_prepared_request_releases_id_on_cancellation:
+    // dropping the future mid-exchange must not leak the reserved id.
+    let transport = FakeTransport::new(|_request| vec![]);
+    let d = Arc::new(dispatcher(
+        upcast(Arc::clone(&transport)),
+        Duration::from_secs(60),
+        1,
+    ));
+    let request = d
+        .prepare_request(PduKind::GetRequest, sys_uptime_varbind(), 0, 0)
+        .unwrap();
+    let request_id = request.request_id;
+    assert_eq!(d.issued_request_ids(), vec![request_id]);
+
+    let handle = tokio::spawn({
+        let d = Arc::clone(&d);
+        async move {
+            let _ = d.send_prepared_request(request).await;
+        }
+    });
+    // Wait until the request was sent, then cancel while it waits forever.
+    for _ in 0..100 {
+        if transport.sent_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(transport.sent_count() >= 1, "request must have been sent");
+    handle.abort();
+    let _ = handle.await;
+
+    // The IdGuard released the id despite the cancellation.
+    assert!(
+        d.issued_request_ids().is_empty(),
+        "no leaked request ids after cancellation"
+    );
+}
+
+#[tokio::test]
 async fn prepare_request_reserves_and_release_frees() {
     let d = dispatcher(FakeTransport::new(|_| vec![]), Duration::from_millis(20), 1);
     let request = d
@@ -661,6 +701,57 @@ async fn v1_get_bulk_non_repeaters() {
         ]
     );
     assert_eq!(agent.request_count(), 3);
+    agent.stop();
+}
+
+#[tokio::test]
+async fn v1_get_bulk_interleaves_repeaters_repetition_major() {
+    // Port of test_v1_manager.py:577: two repeater columns interleave in
+    // repetition-major order [x1, y1, x2, y2] — the headline V1 GETBULK quirk.
+    let objects = vec![
+        (
+            oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1]),
+            SnmpValue::OctetString(b"1".to_vec()),
+        ),
+        (
+            oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 2]),
+            SnmpValue::OctetString(b"2".to_vec()),
+        ),
+        (
+            oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
+            SnmpValue::OctetString(b"eth0".to_vec()),
+        ),
+        (
+            oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 2]),
+            SnmpValue::OctetString(b"eth1".to_vec()),
+        ),
+    ];
+    let (agent, port) = FakeAgent::spawn(object_logic(objects, true)).await;
+    let manager = Manager::connect_v1(v1_manager_config(port, "public"))
+        .await
+        .unwrap();
+    let response = manager
+        .get_bulk(vec!["1.3.6.1.2.1.2.2.1.1.2", "1.3.6.1.2.1.2.2.1.1.1"], 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(response.error_status, ErrorStatus::NoError);
+    let oids: Vec<String> = response.varbinds.iter().map(|v| v.oid.display()).collect();
+    assert_eq!(
+        oids,
+        vec![
+            "1.3.6.1.2.1.2.2.1.2.1".to_string(), // ifDescr.1: successor of ifIndex.2 (x1)
+            "1.3.6.1.2.1.2.2.1.1.2".to_string(), // ifIndex.2: successor of ifIndex.1 (y1)
+            "1.3.6.1.2.1.2.2.1.2.2".to_string(), // ifDescr.2: successor of ifDescr.1 (x2)
+            "1.3.6.1.2.1.2.2.1.2.1".to_string(), // ifDescr.1: successor of ifIndex.2 (y2)
+        ]
+    );
+    assert_eq!(agent.request_count(), 4);
+    assert!(
+        agent
+            .requested_kinds()
+            .iter()
+            .all(|kind| *kind == PduKind::GetNextRequest)
+    );
     agent.stop();
 }
 

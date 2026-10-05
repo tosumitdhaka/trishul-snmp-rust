@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::codec::pdu::{Pdu, PduKind};
 use crate::error::{Error, ProtocolError};
@@ -19,6 +21,20 @@ pub struct PreparedRequest {
     pub request_id: u32,
     /// The wrapped, ready-to-send datagram.
     pub encoded_message: Vec<u8>,
+}
+
+/// RAII guard releasing a reserved request id on drop — including when the
+/// enclosing future is cancelled at an await point. Without it a dropped
+/// request would leak its id for the dispatcher's lifetime.
+struct IdGuard<'a> {
+    dispatcher: &'a RequestDispatcher,
+    request_id: u32,
+}
+
+impl Drop for IdGuard<'_> {
+    fn drop(&mut self) {
+        self.dispatcher.release_request(self.request_id);
+    }
 }
 
 /// The 31-bit request-id space reserved by SNMPv2 (RFC 3416 §4.1.5).
@@ -141,11 +157,15 @@ impl RequestDispatcher {
     }
 
     /// Sends a prepared request and waits for its matching response, retrying
-    /// up to `retries + 1` times. The request id is always released on exit.
+    /// up to `retries + 1` times. The request id is released on every exit
+    /// path — including caller cancellation, via the `IdGuard` held across
+    /// the whole exchange.
     pub async fn send_prepared_request(&self, request: PreparedRequest) -> Result<Pdu, Error> {
-        let result = self.send_prepared_request_inner(&request).await;
-        self.release_request(request.request_id);
-        result
+        let _guard = IdGuard {
+            dispatcher: self,
+            request_id: request.request_id,
+        };
+        self.send_prepared_request_inner(&request).await
     }
 
     async fn send_prepared_request_inner(&self, request: &PreparedRequest) -> Result<Pdu, Error> {
@@ -165,11 +185,14 @@ impl RequestDispatcher {
         })
     }
 
-    /// Waits for a response matching `request_id`, releasing the id on exit.
+    /// Waits for a response matching `request_id`, releasing the id on exit
+    /// (including cancellation, via the `IdGuard`).
     pub async fn receive_response(&self, request_id: u32) -> Result<Pdu, Error> {
-        let result = self.receive_matching_response(request_id).await;
-        self.release_request(request_id);
-        result
+        let _guard = IdGuard {
+            dispatcher: self,
+            request_id,
+        };
+        self.receive_matching_response(request_id).await
     }
 
     async fn receive_matching_response(&self, request_id: u32) -> Result<Pdu, Error> {

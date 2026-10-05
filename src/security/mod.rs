@@ -13,7 +13,7 @@ use crate::transport::dispatcher::RequestDispatcher;
 ///
 /// `wrap_pdu` serializes an outbound PDU into the authenticated datagram;
 /// `unwrap_message` validates an inbound datagram and reports
-/// [`UnwrapOutcome`]. The [`SecurityModel::Usm`] variant lands in Phase 3;
+/// [`UnwrapOutcome`]. The USM variant (`SecurityModel::Usm`) lands in Phase 3;
 /// until then only community security is constructible.
 #[derive(Clone)]
 pub enum SecurityModel {

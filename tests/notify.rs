@@ -217,6 +217,26 @@ async fn v1_send_trap_default_spec_uses_enterprise_specific() {
 }
 
 #[tokio::test]
+async fn v1_notifier_rejects_v2c_trap_method() {
+    let (agent, port) = FakeAgent::spawn(scripted_logic(
+        Default::default(),
+        Default::default(),
+        false,
+    ))
+    .await;
+    let notifier = Notifier::connect_v1(v1_config(port)).await.unwrap();
+    let err = notifier
+        .send_trap("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("send_trap requires a v2c notifier")
+    );
+    agent.stop();
+}
+
+#[tokio::test]
 async fn v2c_notifier_rejects_v1_trap_method() {
     let (agent, port) = FakeAgent::spawn(scripted_logic(
         Default::default(),
@@ -275,7 +295,6 @@ async fn v2c_send_inform_waiting_for_response_times_out_when_agent_is_silent() {
     // An agent that absorbs datagrams without replying.
     let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let port = socket.local_addr().unwrap().port();
-    let shutdown = Arc::new(tokio::sync::watch::Sender::new(false));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let task_socket = Arc::clone(&socket);
     let absorb = tokio::spawn(async move {
@@ -293,7 +312,6 @@ async fn v2c_send_inform_waiting_for_response_times_out_when_agent_is_silent() {
             }
         }
     });
-    let _ = shutdown;
     let notifier = Notifier::connect_v2c(V2cNotifierConfig {
         host: "127.0.0.1".to_string(),
         port,
@@ -339,6 +357,100 @@ async fn v1_send_trap_applies_sys_uptime_override() {
     assert_eq!(trap.timestamp, 777);
     assert_eq!(message.pdu.varbinds[0].value, SnmpValue::TimeTicks(777));
     agent.stop();
+}
+
+#[tokio::test]
+async fn v2c_send_trap_releases_request_id_on_send_failure() {
+    // Port of test_notification_send.py's send-failure release case: a failed
+    // trap send must not leave the request id reserved.
+    let security = Arc::new(trishul_snmp::security::SecurityModel::Community(
+        trishul_snmp::security::community::CommunityModel::new(
+            b"public".to_vec(),
+            trishul_snmp::codec::message::SnmpVersion::V2c,
+        )
+        .unwrap(),
+    ));
+    let client: Arc<dyn trishul_snmp::transport::udp::UdpTransport> = Arc::new(SendFailTransport);
+    let dispatcher = trishul_snmp::transport::dispatcher::RequestDispatcher::new(
+        Arc::clone(&client),
+        Arc::clone(&security),
+        Duration::from_millis(100),
+        0,
+        Arc::new(common::fake::FakeRng::new(&[1, 0, 0, 0])),
+    )
+    .unwrap();
+    let session = trishul_snmp::session::SnmpSession::from_parts(security, client, dispatcher);
+    let notifier = Notifier {
+        session,
+        version: SnmpVersion::V2c,
+    };
+    let err = notifier
+        .send_trap("1.3.6.1.6.3.1.1.5.1", &[], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+    assert!(
+        notifier.session.dispatcher.issued_request_ids().is_empty(),
+        "failed trap send released its request id"
+    );
+}
+
+struct SendFailTransport;
+
+impl trishul_snmp::transport::udp::UdpTransport for SendFailTransport {
+    fn open(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), trishul_snmp::error::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+    fn close(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), trishul_snmp::error::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+    fn send(
+        &self,
+        _data: &[u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), trishul_snmp::error::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(trishul_snmp::error::TransportError::Io(
+                "send failed".to_string(),
+            ))
+        })
+    }
+    fn receive(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<u8>, trishul_snmp::error::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            tokio::time::sleep(timeout).await;
+            Err(trishul_snmp::error::TransportError::Timeout)
+        })
+    }
 }
 
 #[tokio::test]
