@@ -1,1 +1,138 @@
 //! CommunityModel (← community.py)
+
+use crate::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
+use crate::codec::pdu::Pdu;
+use crate::error::{Error, ProtocolError, UnwrapOutcome};
+
+/// Community-based security model for v1/v2c (← community.py:CommunityModel).
+///
+/// The community string is bytewise (locked decision: no latin-1 fallback).
+/// Version and community mismatches yield [`UnwrapOutcome::NotForUs`] so the
+/// dispatcher skips foreign datagrams instead of failing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommunityModel {
+    community: Vec<u8>,
+    version: SnmpVersion,
+}
+
+impl CommunityModel {
+    /// Creates a community model for a specific SNMP version. The version is
+    /// part of the identity: an agent answering a v1 request with a v2c
+    /// response is not for us (community.py:39–49).
+    pub fn new(community: Vec<u8>, version: SnmpVersion) -> Result<Self, ProtocolError> {
+        let model = Self { community, version };
+        Ok(model)
+    }
+
+    /// The community bytes.
+    #[must_use]
+    pub fn community(&self) -> &[u8] {
+        &self.community
+    }
+
+    /// The SNMP version this model wraps.
+    #[must_use]
+    pub fn version(&self) -> SnmpVersion {
+        self.version
+    }
+
+    /// Wraps a PDU into a v1/v2c message datagram.
+    pub fn wrap_pdu(&self, pdu: &Pdu) -> Result<Vec<u8>, Error> {
+        let message = SnmpMessage {
+            version: self.version,
+            community: self.community.clone(),
+            pdu: pdu.clone(),
+        };
+        encode_message(&message).map_err(Error::Protocol)
+    }
+
+    /// Validates an inbound datagram against this community and version.
+    pub fn unwrap_message(&self, data: &[u8]) -> UnwrapOutcome {
+        let message = match decode_message(data) {
+            Ok(message) => message,
+            Err(error) => return UnwrapOutcome::Malformed(error),
+        };
+        if message.version != self.version {
+            return UnwrapOutcome::NotForUs;
+        }
+        if message.community != self.community {
+            return UnwrapOutcome::NotForUs;
+        }
+        UnwrapOutcome::Ok(message.pdu)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::oid::Oid;
+    use crate::types::value::SnmpValue;
+    use crate::types::varbind::VarBind;
+
+    fn test_oid(arcs: &[u32]) -> Oid {
+        Oid::from_arcs(arcs).unwrap()
+    }
+
+    fn get_pdu(request_id: u32) -> Pdu {
+        Pdu {
+            kind: crate::codec::pdu::PduKind::GetRequest,
+            request_id,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                test_oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]),
+                SnmpValue::Null,
+            )],
+            v1_trap: None,
+        }
+    }
+
+    #[test]
+    fn wrap_and_unwrap_roundtrip() {
+        let model = CommunityModel::new(b"public".to_vec(), SnmpVersion::V2c).unwrap();
+        let wrapped = model.wrap_pdu(&get_pdu(7)).unwrap();
+        match model.unwrap_message(&wrapped) {
+            UnwrapOutcome::Ok(pdu) => assert_eq!(pdu.request_id, 7),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_community_is_not_for_us() {
+        let model = CommunityModel::new(b"public".to_vec(), SnmpVersion::V2c).unwrap();
+        let other = CommunityModel::new(b"private".to_vec(), SnmpVersion::V2c).unwrap();
+        let wrapped = other.wrap_pdu(&get_pdu(7)).unwrap();
+        assert_eq!(model.unwrap_message(&wrapped), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn wrong_version_is_not_for_us() {
+        let v1 = CommunityModel::new(b"public".to_vec(), SnmpVersion::V1).unwrap();
+        let v2c = CommunityModel::new(b"public".to_vec(), SnmpVersion::V2c).unwrap();
+        let wrapped = v2c.wrap_pdu(&get_pdu(7)).unwrap();
+        assert_eq!(v1.unwrap_message(&wrapped), UnwrapOutcome::NotForUs);
+    }
+
+    #[test]
+    fn malformed_datagram_is_malformed() {
+        let model = CommunityModel::new(b"public".to_vec(), SnmpVersion::V2c).unwrap();
+        match model.unwrap_message(b"\x02\x01\x01") {
+            UnwrapOutcome::Malformed(_) => {}
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_is_byte_identical_to_codec_message() {
+        let model = CommunityModel::new(b"public".to_vec(), SnmpVersion::V2c).unwrap();
+        let pdu = get_pdu(123);
+        let wrapped = model.wrap_pdu(&pdu).unwrap();
+        let direct = encode_message(&SnmpMessage {
+            version: SnmpVersion::V2c,
+            community: b"public".to_vec(),
+            pdu,
+        })
+        .unwrap();
+        assert_eq!(wrapped, direct);
+    }
+}

@@ -38,8 +38,16 @@ impl ProtocolError {
 
 /// A socket or network transport failure (← `errors.py:TransportError`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("transport failure: {0}")]
-pub struct TransportError(pub String);
+pub enum TransportError {
+    /// An I/O or resolution failure.
+    #[error("transport failure: {0}")]
+    Io(String),
+    /// A receive timed out (← `RequestTimeoutError`, added: the §6 taxonomy's
+    /// `Error::Timeout` is the post-retry surface; the per-receive timeout is
+    /// carried here so the retry loop can distinguish it from other failures).
+    #[error("SNMP request timed out waiting for a response")]
+    Timeout,
+}
 
 /// A bundled-MIB load or validation failure (← `errors.py:BundleError`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

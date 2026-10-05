@@ -10,6 +10,12 @@ description = "Async SNMP toolkit: manager, notifications, read-only responder, 
 name = "tsnmp"
 path = "src/bin/tsnmp.rs"
 
+# Env-gated conformance suite lives under tests/conformance/; cargo only
+# auto-discovers top-level tests/*.rs, so it is registered explicitly.
+[[test]]
+name = "conformance_snmpd"
+path = "tests/conformance/snmpd.rs"
+
 [dependencies]
 rasn = "=0.28.15"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
