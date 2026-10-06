@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::codec::message::{SnmpMessage, SnmpVersion, decode_message, encode_message};
 use crate::codec::pdu::{Pdu, PduKind};
-use crate::codec::v3::decode_scoped_pdu;
+use crate::codec::v3::{MSG_FLAG_REPORTABLE, V3Message, decode_scoped_pdu};
 use crate::error::Error;
 use crate::mib::MibBundle;
 use crate::notify::listener::{community_allowed, peek_message_version, run_isolated};
@@ -27,7 +27,7 @@ use crate::notify::v3_path::{
     encode_v3_response, is_discovery_probe,
 };
 use crate::security::usm::engine::advance_local_engine;
-use crate::security::usm::{UsmLocalEngine, UsmModel, UsmUser};
+use crate::security::usm::{NOT_IN_TIME_WINDOWS_OID, UsmLocalEngine, UsmModel, UsmUser};
 use crate::target::Target;
 use crate::time::{Clock, Rng, SystemClock, SystemRng};
 use crate::transport::udp::{ReceivedDatagram, UdpServer};
@@ -50,6 +50,10 @@ pub use crate::responder::sources::{
 const DEFAULT_MAX_BULK_REPETITIONS: u32 = 1000;
 /// The responder's default maximum encoded response size (server.py:34).
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 65535;
+/// The RFC 3414 §3.2 step-8 time-window half-width: a request's
+/// msgAuthoritativeEngineTime must be within ±150 s of the local
+/// snmpEngineTime (the listener's replay window, notify/replay.rs:14).
+const TIME_WINDOW_SECONDS: u32 = 150;
 
 /// Responder configuration (§5.7).
 pub struct ResponderConfig {
@@ -276,6 +280,12 @@ impl SnmpResponder {
     ///
     /// The reference rejects a negative `count`; `usize` makes that
     /// unrepresentable. Returns the number of handled requests.
+    ///
+    /// A panic inside a per-datagram handler is caught and logged to stderr
+    /// (`responder: …`), then the loop continues — the responder has no event
+    /// channel to surface into by design (`serve` is the only consumer, unlike
+    /// the listener's `recv`); surfacing panics through a typed channel is a
+    /// post-1.0 candidate.
     pub async fn serve(&self, count: usize) -> Result<usize, Error> {
         let mut handled = 0usize;
         let mut cancel_rx = self.cancel.subscribe();
@@ -367,8 +377,8 @@ impl SnmpResponder {
     }
 
     /// The v3 path: discovery probes get a REPORT advertising the local
-    /// engine; requests are auth-verified, priv-decrypted, answered, and
-    /// re-stamped under the local engine's authority.
+    /// engine; requests are auth-verified, priv-decrypted, window-checked,
+    /// answered, and re-stamped under the local engine's authority.
     fn handle_v3(&self, datagram: &ReceivedDatagram) -> DatagramOutcome {
         let Some(v3) = &self.v3 else {
             return DatagramOutcome::Dropped;
@@ -394,11 +404,47 @@ impl SnmpResponder {
             Ok(fields) => fields,
             Err(_) => return DatagramOutcome::Dropped,
         };
+        let engine_time = v3.current_engine_time();
+        // RFC 3414 §3.2 step 8: an authenticated request outside the local
+        // engine's time window (boots mismatch or more than ±150 s of
+        // snmpEngineTime) is answered with a usmStatsNotInTimeWindows REPORT
+        // — never with the data — so the sender's engine-recovery machinery
+        // can rebase and retry. Only reportable messages get the REPORT;
+        // unconfirmed traffic (traps) is dropped silently.
+        if decoded.view.msg_flags & MSG_FLAG_REPORTABLE != 0
+            && !in_time_window(&decoded.view, &v3.local_engine, engine_time)
+        {
+            let report_pdu = Pdu {
+                kind: PduKind::Report,
+                request_id: pdu.request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    Oid::from_arcs(&NOT_IN_TIME_WINDOWS_OID).expect("fixed OID"),
+                    SnmpValue::Counter32(1),
+                )],
+                v1_trap: None,
+            };
+            return match encode_v3_response(
+                &V3ResponseContext {
+                    view: &decoded.view,
+                    context_engine_id: &context_engine_id,
+                    context_name: &context_name,
+                },
+                &report_pdu,
+                &v3.user,
+                &v3.local_engine,
+                &v3.codec,
+                Some(engine_time),
+            ) {
+                Ok(report) => DatagramOutcome::Respond(report),
+                Err(_) => DatagramOutcome::Dropped,
+            };
+        }
         let response_pdu = match self.build_response_pdu(&pdu, false) {
             Some(pdu) => pdu,
             None => return DatagramOutcome::Dropped,
         };
-        let engine_time = v3.current_engine_time();
         let encoded = self.encode_response(pdu.kind, response_pdu, |pdu| {
             encode_v3_response(
                 &V3ResponseContext {
@@ -458,7 +504,15 @@ impl SnmpResponder {
                 }
             }
             PduKind::GetBulkRequest => {
-                // GETBULK is a v2c/v3 PDU; a v1 message can never carry it.
+                // GETBULK is a v2c/v3-only PDU (tag 0xA5 does not exist in
+                // RFC 1157). The codec decodes a hand-crafted v1 message
+                // carrying this tag; answering it would produce a
+                // protocol-invalid v1 response (v2-only exception values),
+                // so the datagram is dropped like the reference drops
+                // protocol-invalid v1 at the boundary.
+                if v1 {
+                    return None;
+                }
                 let varbinds = self.build_bulk_varbinds(
                     &request_pdu.varbinds,
                     request_pdu.non_repeaters(),
@@ -582,6 +636,15 @@ impl Drop for SnmpResponder {
     }
 }
 
+/// Whether a request's authoritative engine state is inside the local
+/// engine's RFC 3414 §3.2 step-8 time window: same boots, and the
+/// msgAuthoritativeEngineTime within ±150 s of the local snmpEngineTime.
+fn in_time_window(view: &V3Message, local_engine: &UsmLocalEngine, local_time: u32) -> bool {
+    let boots = view.usm_params.engine_boots.max(0) as u32;
+    let time = view.usm_params.engine_time.max(0) as u32;
+    boots == local_engine.engine_boots && time.abs_diff(local_time) <= TIME_WINDOW_SECONDS
+}
+
 /// v1 GET answering (RFC 1157 §4.1.1): every varbind is looked up exactly;
 /// the first missing one yields a `noSuchName` error echoing the request
 /// varbinds (v2-only exception values do not exist in v1).
@@ -625,4 +688,55 @@ fn v1_get_next_varbinds(
         }
     }
     (varbinds, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Direct test of the v2c `Err → Dropped` branch (the `Err(_) =>
+    /// DatagramOutcome::Dropped` arm of `handle_community`): an unencodable
+    /// response is never sent. The reference's unencodable-value case
+    /// (`Counter32Value(2**32)`) is unrepresentable with the `SnmpValue`
+    /// enum, so the encode failure is injected with a crafted PDU whose
+    /// `to_raw` rejects it: `v1_trap` fields on a non-Trap PDU
+    /// (pdu.rs:129–133).
+    #[tokio::test]
+    async fn encode_response_propagates_unencodable_response() {
+        let responder = SnmpResponder::bind(ResponderConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("bind test responder");
+        let unencodable = Pdu {
+            kind: PduKind::Response,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: Vec::new(),
+            v1_trap: Some(crate::codec::pdu::V1TrapFields {
+                enterprise: Oid::from_arcs(&[1, 3, 6]).expect("valid OID"),
+                agent_addr: std::net::Ipv4Addr::LOCALHOST,
+                generic_trap: 0,
+                specific_trap: 0,
+                timestamp: 0,
+            }),
+        };
+        let err = responder
+            .encode_response(PduKind::GetRequest, unencodable, |pdu| {
+                encode_message(&SnmpMessage {
+                    version: SnmpVersion::V2c,
+                    community: b"public".to_vec(),
+                    pdu: pdu.clone(),
+                })
+                .map_err(Error::Protocol)
+            })
+            .expect_err("an unencodable response must surface as an error");
+        assert!(
+            err.to_string().contains("v1_trap"),
+            "encode failure surfaced: {err}"
+        );
+    }
 }

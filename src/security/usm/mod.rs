@@ -33,8 +33,9 @@ use crate::types::varbind::VarBind;
 
 /// Maximum message size declared by this implementation's sends.
 const MAX_MSG_SIZE: i64 = 65507;
-/// usmStatsNotInTimeWindows.0 (RFC 3414 §5.2.3).
-const NOT_IN_TIME_WINDOWS_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0];
+/// usmStatsNotInTimeWindows.0 (RFC 3414 §5.2.3) — shared with the
+/// responder's out-of-window REPORT path.
+pub(crate) const NOT_IN_TIME_WINDOWS_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0];
 /// usmStatsUnknownUserNames.0 — the discovery probe target.
 const UNKNOWN_USER_NAMES_OID: [u32; 11] = [1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0];
 

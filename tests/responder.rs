@@ -212,6 +212,41 @@ fn counter_rule_increment_larger_than_modulus_wraps() {
 }
 
 #[test]
+fn counter_rule_is_atomic_under_concurrency() {
+    // Review item 5: the counter's load→advance→store is a compare_exchange
+    // loop — concurrent readers must never observe duplicate values.
+    let rule = Arc::new(CounterRule::new(0, 1, CounterValueType::Counter64).unwrap());
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let rule = Arc::clone(&rule);
+        handles.push(std::thread::spawn(move || {
+            let mut values = Vec::with_capacity(1000);
+            for _ in 0..1000 {
+                values.push(rule.get_value());
+            }
+            values
+        }));
+    }
+    let mut all: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|handle| handle.join().unwrap())
+        .map(|value| match value {
+            SnmpValue::Counter64(value) => value,
+            other => panic!("expected Counter64, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(all.len(), 8000);
+    all.sort_unstable();
+    let duplicates = all.windows(2).filter(|pair| pair[0] == pair[1]).count();
+    assert_eq!(
+        duplicates, 0,
+        "no duplicate counter values under concurrency"
+    );
+    assert_eq!(all[0], 0, "values are a consecutive run from 0");
+    assert_eq!(all[7999], 7999);
+}
+
+#[test]
 fn counter_rule_rejects_invalid_inputs() {
     // RE-SPECIFIED: the reference's negative start/increment ValueError is
     // unrepresentable with u64; the wire-modulus check is portable.
@@ -1601,4 +1636,152 @@ fn harness_fake_clock_and_rng_are_deterministic() {
     let mut buf = [0u8; 4];
     Arc::new(CounterRng::new(7)).fill_bytes(&mut buf);
     assert_eq!(buf, [0, 0, 0, 7]);
+}
+
+// ── review round 2: engine-time window, v1 GETBULK, counter atomicity ───────
+
+#[tokio::test]
+async fn v3_out_of_window_request_gets_not_in_time_windows_report() {
+    // RFC 3414 §3.2 step 8: an authenticated request whose authoritative
+    // engine time is outside the local engine's ±150 s window is answered
+    // with a usmStatsNotInTimeWindows REPORT (never with the data), stamped
+    // under the local engine with the request's msg-id/request-id echoed.
+    let user = v3_auth_user("simulator");
+    let mut cfg = config(
+        None,
+        vec![object(
+            &[1, 3, 6, 1, 2, 1, 1, 3, 0],
+            SnmpValue::TimeTicks(9),
+        )],
+    );
+    cfg.v3 = Some((user.clone(), local_engine(1000)));
+    let (responder, _port) = spawn(cfg).await;
+    let serve = start_serve(&responder);
+
+    // A stale request: same engine, boots=1, but engine time 500 s behind the
+    // local engine's (1000).
+    let stale = UsmModel::new(user, Vec::new(), None, clock(), rng());
+    stale.adopt_engine_state(ENGINE_ID.to_vec(), 1, 500);
+    let raw = stale
+        .wrap_pdu(&get_pdu(7, &[1, 3, 6, 1, 2, 1, 1, 3, 0]))
+        .unwrap();
+    let reply = exchange(&responder, &raw)
+        .await
+        .expect("out-of-window REPORT");
+
+    // The report drives the engine-recovery flow: auth verified, the
+    // usmStatsNotInTimeWindows varbind recognized, the new engine state
+    // adopted.
+    assert_eq!(
+        stale.unwrap_message(&reply),
+        UnwrapOutcome::EngineRecoveryPending
+    );
+    assert!(stale.take_recovery().is_some(), "recovery report stashed");
+
+    let view = decode_v3_message(&reply).unwrap();
+    assert_eq!(view.usm_params.engine_id, ENGINE_ID);
+    assert_eq!(view.usm_params.engine_boots, 1);
+    assert!(
+        (1000..=1150).contains(&(view.usm_params.engine_time as u32)),
+        "report carries the local engine time, got {}",
+        view.usm_params.engine_time
+    );
+    let (_engine_id, _context, pdu) = decode_scoped_pdu(&view.msg_data_bytes).unwrap();
+    assert_eq!(pdu.kind, PduKind::Report);
+    assert_eq!(pdu.request_id, 7);
+    assert_eq!(
+        pdu.varbinds[0].oid,
+        oid(&[1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0])
+    );
+    assert_eq!(pdu.varbinds[0].value, SnmpValue::Counter32(1));
+
+    responder.close();
+    serve.await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_not_in_time_windows_recovery_roundtrip() {
+    // The manager↔responder composition of the window check: after discovery
+    // the responder's engine time is advanced 200 s past the adopted
+    // snapshot, so the next request is answered with a
+    // usmStatsNotInTimeWindows REPORT; the manager's engine-recovery
+    // machinery adopts the report's boots/time and retries — the get
+    // succeeds end-to-end.
+    let user = v3_auth_user("simulator");
+    let fake = Arc::new(FakeClock::new(Duration::ZERO, 0));
+    let mut cfg = config(
+        None,
+        vec![object(
+            &[1, 3, 6, 1, 2, 1, 1, 3, 0],
+            SnmpValue::TimeTicks(9),
+        )],
+    );
+    cfg.clock = fake.clone();
+    cfg.v3 = Some((user.clone(), local_engine(1000)));
+    let (responder, port) = spawn(cfg).await;
+    let serve = start_serve(&responder);
+
+    let manager = Manager::connect_v3(V3Config {
+        host: "127.0.0.1".to_string(),
+        port,
+        user,
+        context_name: Vec::new(),
+        local_engine: None,
+        bundle: None,
+        timeout: Duration::from_millis(500),
+        retries: 0,
+        clock: Arc::new(SystemClock),
+        rng: Arc::new(SystemRng),
+    })
+    .await
+    .expect("connect v3 manager");
+
+    // Discovery adopted (boots=1, time=1000). Advance the responder's engine
+    // time 200 s past that snapshot: the next request is out of window.
+    fake.set_monotonic(Duration::from_secs(200));
+
+    let response = manager.get(vec!["1.3.6.1.2.1.1.3.0"]).await.unwrap();
+    assert_eq!(response.error_status, ErrorStatus::NoError);
+    assert_eq!(response.varbinds[0].value, SnmpValue::TimeTicks(9));
+
+    responder.close();
+    serve.await.unwrap();
+}
+
+#[tokio::test]
+async fn v1_getbulk_is_dropped() {
+    // NIT 3: the codec decodes a hand-crafted v1 message carrying a GETBULK
+    // PDU tag (0xA5 is a v2c/v3-only PDU); answering would produce a
+    // protocol-invalid v1 response (v2-only exception values), so the
+    // datagram is dropped like the reference drops protocol-invalid v1 at the
+    // boundary.
+    let (responder, _port) = spawn(config(
+        None,
+        vec![object(
+            &[1, 3, 6, 1, 2, 1, 1, 3, 0],
+            SnmpValue::TimeTicks(9),
+        )],
+    ))
+    .await;
+    let serve = start_serve(&responder);
+    let bulk = message(
+        SnmpVersion::V1,
+        "public",
+        get_bulk_pdu(7, 0, 5, &[1, 3, 6, 1, 2, 1, 1, 3, 0]),
+    );
+    assert!(
+        exchange(&responder, &bulk).await.is_none(),
+        "v1 GETBULK is dropped without a response"
+    );
+    let valid = message(
+        SnmpVersion::V1,
+        "public",
+        get_pdu(8, &[1, 3, 6, 1, 2, 1, 1, 3, 0]),
+    );
+    assert!(
+        exchange(&responder, &valid).await.is_some(),
+        "responder stays available for valid v1 requests"
+    );
+    responder.close();
+    serve.await.unwrap();
 }

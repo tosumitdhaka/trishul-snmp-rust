@@ -96,7 +96,7 @@ fn v3_conf(port: u16) -> String {
 /// The v3 authNoPriv agent binds the fixture's 1162 (the fixture's v3 users
 /// are pinned to that port; USM identity is the engineID, and the createUser
 /// lines are kept byte-identical). If the port is occupied at test time the
-/// suite self-skips with a clear message rather than falling back.
+/// suite respawns once on an OS-assigned port — see [`v3_effective_port`].
 const V3_PORT: u16 = 1162;
 
 /// The v3 authPriv agent binds a DISTINCT port from the authNoPriv suite so
@@ -105,6 +105,28 @@ const V3_PORT: u16 = 1162;
 /// the readiness loop would spin — review I2). 1174 is the fixture's
 /// dedicated v3-only port in the reference deployment.
 const V3_PRIV_PORT: u16 = 1174;
+
+/// The v3 agent's effective port (review round 2): the preferred fixture port
+/// when free, otherwise an OS-assigned fallback. USM identity is the
+/// engineID — the createUser rows stay byte-identical; only `agentaddress`
+/// changes (the precedent the 1174 suite already set). A pre-flight UDP bind
+/// probe detects an externally-held port; snmpd does NOT exit when its bind
+/// fails, so probing is the only reliable signal.
+fn v3_effective_port(preferred: u16) -> u16 {
+    if std::net::UdpSocket::bind(("127.0.0.1", preferred)).is_ok() {
+        preferred
+    } else {
+        eprintln!(
+            "conformance: v3 port {preferred} is held by another process; \
+             respawning on an OS-assigned port"
+        );
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("bind ephemeral probe")
+            .local_addr()
+            .expect("probe has an address")
+            .port()
+    }
+}
 
 /// Spawns a snmpd with `conf`; returns the child plus the working directory.
 /// Kills the snmpd child on drop so a panicking test cannot leak an agent.
@@ -311,7 +333,7 @@ async fn conformance_v3_authnopriv_matrix() {
         eprintln!("TSNMP_SNMPD unset: skipping snmpd v3 conformance suite");
         return;
     }
-    let port = V3_PORT;
+    let port = v3_effective_port(V3_PORT);
     let Some((mut agent, _workdir)) = spawn_snmpd(&v3_conf(port), "v3") else {
         eprintln!("conformance: cannot spawn snmpd for the v3 agent on {port}; skipping v3 suite");
         return;
@@ -385,7 +407,7 @@ async fn conformance_v3_authpriv_matrix() {
         eprintln!("TSNMP_SNMPD unset: skipping snmpd v3 authPriv conformance suite");
         return;
     }
-    let port = V3_PRIV_PORT;
+    let port = v3_effective_port(V3_PRIV_PORT);
     let Some((mut agent, _workdir)) = spawn_snmpd(&v3_conf(port), "v3priv") else {
         eprintln!("conformance: cannot spawn snmpd for the v3 authPriv agent on {port}; skipping");
         return;

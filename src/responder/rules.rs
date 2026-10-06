@@ -79,19 +79,35 @@ impl CounterRule {
     }
 
     /// The current counter value, then advance (← rules.py:77–82).
+    ///
+    /// The load→advance→store runs as a `compare_exchange` loop so concurrent
+    /// readers can never observe a duplicate value (a plain load/store pair
+    /// would let two readers return the same counter value).
     #[must_use]
     pub fn get_value(&self) -> SnmpValue {
-        let value = self.current.load(Ordering::Relaxed);
-        let mut next = value.wrapping_add(self.increment);
-        if let Some(modulus) = self.modulus
-            && next >= modulus
-        {
-            next %= modulus;
-        }
-        self.current.store(next, Ordering::Relaxed);
-        match self.value_type {
-            CounterValueType::Counter32 => SnmpValue::Counter32(value as u32),
-            CounterValueType::Counter64 => SnmpValue::Counter64(value),
+        let mut current = self.current.load(Ordering::Relaxed);
+        loop {
+            let value = current;
+            let mut next = value.wrapping_add(self.increment);
+            if let Some(modulus) = self.modulus
+                && next >= modulus
+            {
+                next %= modulus;
+            }
+            match self.current.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return match self.value_type {
+                        CounterValueType::Counter32 => SnmpValue::Counter32(value as u32),
+                        CounterValueType::Counter64 => SnmpValue::Counter64(value),
+                    };
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -128,6 +144,12 @@ pub struct RandomNumericRule {
 impl RandomNumericRule {
     /// Creates a rule drawing from `min..=max` (inclusive, as
     /// `random.randint`).
+    ///
+    /// The reference raises `ValueError` when `max < min` (Python's
+    /// `random.randint` rejects an empty range); here the span saturates to a
+    /// single value, so an inverted range always returns `min` — a documented
+    /// deviation (docs/architecture.md §8), outside the reference's tested
+    /// surface.
     #[must_use]
     pub fn new(min: u64, max: u64, value_type: RandomValueType, rng: Arc<dyn Rng>) -> Self {
         Self {
