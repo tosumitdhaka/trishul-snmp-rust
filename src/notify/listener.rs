@@ -412,7 +412,10 @@ impl ListenerHandle {
 /// receive-loop equivalent of the reference raising the exception out of
 /// `receive()`. Without this, a panic would kill the receive task and close
 /// the channel, which is indistinguishable from teardown (`recv() → None`).
-fn run_isolated<T>(handler: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+///
+/// Shared with the responder's serve loop (the responder logs the panic and
+/// keeps serving; it has no event channel to surface into).
+pub(crate) fn run_isolated<T>(handler: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     match catch_unwind(AssertUnwindSafe(handler)) {
         Ok(value) => value,
         Err(payload) => Err(Error::Protocol(ProtocolError::new(panic_message(payload)))),
@@ -847,8 +850,8 @@ fn tracked_decode_v3(data: &[u8]) -> Result<V3DecodedDatagram, ProtocolError> {
 }
 
 /// Decodes just the version INTEGER of a message, without a full decode
-/// (listener.py:430–440).
-fn peek_message_version(data: &[u8]) -> Result<i64, ProtocolError> {
+/// (listener.py:430–440). Shared with the responder's version dispatch.
+pub(crate) fn peek_message_version(data: &[u8]) -> Result<i64, ProtocolError> {
     let (tag, content, _offset) = crate::codec::decode_tlv(data, 0)?;
     if tag != 0x30 {
         return Err(ProtocolError::new(format!(
@@ -867,8 +870,8 @@ fn peek_message_version(data: &[u8]) -> Result<i64, ProtocolError> {
     decode_signed_content(raw)
 }
 
-/// Community allow-listing (listener.py:403–412).
-fn community_allowed(communities: &Option<Vec<Vec<u8>>>, community: &[u8]) -> bool {
+/// Community allow-listing (listener.py:403–412). Shared with the responder.
+pub(crate) fn community_allowed(communities: &Option<Vec<Vec<u8>>>, community: &[u8]) -> bool {
     match communities {
         None => true,
         Some(allowed) => allowed.iter().any(|candidate| candidate == community),

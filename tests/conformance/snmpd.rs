@@ -532,6 +532,256 @@ fn version_marker_compiles() {
     let _ = PduKind::GetRequest;
 }
 
+// ── Responder inverse direction (real net-snmp clients → trishul responder) ──
+//
+// Port of test_snmpd_integration.py:466–619 — the plan.md Phase 7 gate: the
+// net-snmp `snmpget`/`snmpwalk` client tools read from our responder (the
+// reference does exactly this). Gated on `TSNMP_SNMPD=1` like the rest of
+// this suite, and additionally self-skipping when the tools are absent.
+
+/// The responder's object seed set (test_snmpd_integration.py:_RESPONDER_OBJECTS).
+fn responder_objects() -> Vec<(
+    trishul_snmp::target::Target,
+    trishul_snmp::responder::ObjectValue,
+)> {
+    use trishul_snmp::responder::ObjectValue;
+    use trishul_snmp::target::Target;
+    vec![
+        (
+            Target::from("1.3.6.1.2.1.1.1.0"),
+            ObjectValue::Static(SnmpValue::OctetString(
+                b"trishul-responder integration agent".to_vec(),
+            )),
+        ),
+        (
+            Target::from("1.3.6.1.2.1.1.3.0"),
+            ObjectValue::Static(SnmpValue::TimeTicks(123456)),
+        ),
+        (
+            Target::from("1.3.6.1.2.1.2.2.1.1.1"),
+            ObjectValue::Static(SnmpValue::Integer(1)),
+        ),
+        (
+            Target::from("1.3.6.1.2.1.2.2.1.1.2"),
+            ObjectValue::Static(SnmpValue::Integer(2)),
+        ),
+        (
+            Target::from("1.3.6.1.2.1.2.2.1.2.1"),
+            ObjectValue::Static(SnmpValue::OctetString(b"eth0".to_vec())),
+        ),
+        (
+            Target::from("1.3.6.1.2.1.2.2.1.2.2"),
+            ObjectValue::Static(SnmpValue::OctetString(b"eth1".to_vec())),
+        ),
+    ]
+}
+
+/// Whether the net-snmp client tools are installed.
+fn net_snmp_tools_available() -> bool {
+    std::process::Command::new("snmpget")
+        .arg("-h")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+        && std::process::Command::new("snmpwalk")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+}
+
+/// Runs a net-snmp client tool and returns `(exit_code, combined output)`
+/// (test_snmpd_integration.py:_run_net_snmp).
+async fn run_net_snmp(tool: &str, args: &[&str]) -> (i32, String) {
+    let tool = tool.to_string();
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(&tool)
+            .args(&args)
+            .output()
+            .expect("net-snmp tool runs");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        (
+            output.status.code().unwrap_or(1),
+            format!("{stdout}{stderr}"),
+        )
+    })
+    .await
+    .expect("subprocess task")
+}
+
+/// Binds a v2c responder seeded with the integration objects and serves it on
+/// a spawned task; returns `(responder, port, serve_handle)`.
+async fn spawn_responder_agent() -> (
+    Arc<trishul_snmp::responder::SnmpResponder>,
+    u16,
+    tokio::task::JoinHandle<usize>,
+) {
+    let responder = Arc::new(
+        trishul_snmp::responder::SnmpResponder::bind(trishul_snmp::responder::ResponderConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            communities: Some(vec![b"public".to_vec()]),
+            objects: responder_objects(),
+            ..Default::default()
+        })
+        .await
+        .expect("bind responder"),
+    );
+    let port = responder.local_addr().port();
+    let serve = {
+        let responder = Arc::clone(&responder);
+        tokio::spawn(async move { responder.serve(0).await.expect("serve loop") })
+    };
+    (responder, port, serve)
+}
+
+#[tokio::test]
+async fn conformance_responder_real_snmpget() {
+    if !gate_open() {
+        eprintln!("TSNMP_SNMPD unset: skipping responder net-snmp conformance");
+        return;
+    }
+    if !net_snmp_tools_available() {
+        eprintln!("conformance: net-snmp client tools not installed; skipping");
+        return;
+    }
+    let (responder, port, serve) = spawn_responder_agent().await;
+    let target = format!("127.0.0.1:{port}");
+
+    let (code_descr, out_descr) = run_net_snmp(
+        "snmpget",
+        &[
+            "-v2c",
+            "-c",
+            "public",
+            "-On",
+            "-t",
+            "1",
+            "-r",
+            "0",
+            &target,
+            "1.3.6.1.2.1.1.1.0",
+        ],
+    )
+    .await;
+    let (code_uptime, out_uptime) = run_net_snmp(
+        "snmpget",
+        &[
+            "-v2c",
+            "-c",
+            "public",
+            "-On",
+            "-t",
+            "1",
+            "-r",
+            "0",
+            &target,
+            "1.3.6.1.2.1.1.3.0",
+        ],
+    )
+    .await;
+
+    responder.close();
+    let _handled = serve.await.expect("serve loop");
+
+    assert_eq!(code_descr, 0, "snmpget sysDescr: {out_descr}");
+    assert!(
+        out_descr.contains("trishul-responder integration agent"),
+        "snmpget output: {out_descr}"
+    );
+    assert_eq!(code_uptime, 0, "snmpget sysUpTime: {out_uptime}");
+    assert!(
+        out_uptime.contains("Timeticks: (123456)"),
+        "snmpget output: {out_uptime}"
+    );
+}
+
+#[tokio::test]
+async fn conformance_responder_real_snmpwalk() {
+    if !gate_open() {
+        eprintln!("TSNMP_SNMPD unset: skipping responder net-snmp conformance");
+        return;
+    }
+    if !net_snmp_tools_available() {
+        eprintln!("conformance: net-snmp client tools not installed; skipping");
+        return;
+    }
+    let (responder, port, serve) = spawn_responder_agent().await;
+    let target = format!("127.0.0.1:{port}");
+
+    let (code, out) = run_net_snmp(
+        "snmpwalk",
+        &[
+            "-v2c",
+            "-c",
+            "public",
+            "-On",
+            "-t",
+            "1",
+            "-r",
+            "0",
+            &target,
+            "1.3.6.1.2.1.2.2.1.1",
+        ],
+    )
+    .await;
+
+    responder.close();
+    let _handled = serve.await.expect("serve loop");
+
+    assert_eq!(code, 0, "snmpwalk: {out}");
+    assert!(
+        out.contains(".1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1"),
+        "snmpwalk output: {out}"
+    );
+    assert!(
+        out.contains(".1.3.6.1.2.1.2.2.1.1.2 = INTEGER: 2"),
+        "snmpwalk output: {out}"
+    );
+}
+
+#[tokio::test]
+async fn conformance_responder_real_snmpget_missing_oid() {
+    if !gate_open() {
+        eprintln!("TSNMP_SNMPD unset: skipping responder net-snmp conformance");
+        return;
+    }
+    if !net_snmp_tools_available() {
+        eprintln!("conformance: net-snmp client tools not installed; skipping");
+        return;
+    }
+    let (responder, port, serve) = spawn_responder_agent().await;
+    let target = format!("127.0.0.1:{port}");
+
+    let (code, out) = run_net_snmp(
+        "snmpget",
+        &[
+            "-v2c",
+            "-c",
+            "public",
+            "-On",
+            "-t",
+            "1",
+            "-r",
+            "0",
+            &target,
+            "1.3.6.1.2.1.1.1.99",
+        ],
+    )
+    .await;
+
+    responder.close();
+    let _handled = serve.await.expect("serve loop");
+
+    // A GET for an absent OID surfaces noSuchObject to a real net-snmp client.
+    assert_eq!(code, 0, "snmpget missing OID: {out}");
+    assert!(out.contains("No Such Object"), "snmpget output: {out}");
+}
+
 /// The coldStart notification OID (1.3.6.1.6.3.1.1.5.1) — the Phase 5 gate's
 /// "snmpd coldStart trap + inform fixtures" (test_snmpd_integration.py:74).
 const COLDSTART_OID: &str = "1.3.6.1.6.3.1.1.5.1";

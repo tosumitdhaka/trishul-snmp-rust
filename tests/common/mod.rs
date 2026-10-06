@@ -11,6 +11,7 @@ pub mod agent;
 pub mod fake;
 pub mod mib;
 pub mod notify;
+pub mod responder;
 pub mod transport;
 
 use std::sync::Arc;

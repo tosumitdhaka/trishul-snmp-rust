@@ -109,6 +109,37 @@ pub fn decode_v3_notification_message(
     user: &UsmUser,
     codec: &UsmModel,
 ) -> Result<Option<V3NotificationEnvelope>, Error> {
+    let Some(msg_data) = decode_v3_auth_priv(decoded, user, codec)? else {
+        return Ok(None);
+    };
+    let view = &decoded.view;
+    let Some((context_engine_id, context_name, pdu)) = decode_notification_scoped_pdu(&msg_data)?
+    else {
+        return Ok(None);
+    };
+    validate_notification_reportable_flag(view.msg_flags, pdu.kind)?;
+    Ok(Some(V3NotificationEnvelope {
+        view: view.clone(),
+        pdu,
+        context_engine_id,
+        context_name,
+        security_level: security_level_from_flags(view.msg_flags).to_string(),
+    }))
+}
+
+/// The v3 security core shared by the notification and responder consume
+/// paths: username match, security-level validation, auth verification, priv
+/// decryption (notify/v3.py:288–352 request half; responder/v3 answer path).
+///
+/// Returns `Ok(None)` for wrong-user messages. Returns `Ok(Some(msg_data))`
+/// with the plaintext ScopedPDU bytes (the raw `msgData` when privacy is
+/// off). `Err` surfaces authentication failures and malformed messages that
+/// target the configured user.
+pub(crate) fn decode_v3_auth_priv(
+    decoded: &V3DecodedDatagram,
+    user: &UsmUser,
+    codec: &UsmModel,
+) -> Result<Option<Vec<u8>>, Error> {
     let view = &decoded.view;
     if view.usm_params.username != user.username.as_bytes() {
         return Ok(None);
@@ -144,20 +175,7 @@ pub fn decode_v3_notification_message(
             view.usm_params.engine_time,
         )?;
     }
-
-    let Some((context_engine_id, context_name, pdu)) = decode_notification_scoped_pdu(&msg_data)?
-    else {
-        return Ok(None);
-    };
-    validate_notification_reportable_flag(flags, pdu.kind)?;
-
-    Ok(Some(V3NotificationEnvelope {
-        view: view.clone(),
-        pdu,
-        context_engine_id,
-        context_name,
-        security_level: security_level_from_flags(flags).to_string(),
-    }))
+    Ok(Some(msg_data))
 }
 
 /// Classifies a v3 datagram that decoded to no notification for `user`
@@ -234,9 +252,6 @@ pub fn encode_inform_response(
             envelope.pdu.kind
         ))));
     }
-    let flags = envelope.view.msg_flags;
-    validate_security_level(flags, user)?;
-
     let response_pdu = Pdu {
         kind: PduKind::Response,
         request_id: envelope.pdu.request_id,
@@ -245,10 +260,52 @@ pub fn encode_inform_response(
         varbinds: envelope.pdu.varbinds.clone(),
         v1_trap: None,
     };
-    let msg_data = encode_scoped_pdu(
-        &envelope.context_engine_id,
-        &envelope.context_name,
+    encode_v3_response(
+        &V3ResponseContext {
+            view: &envelope.view,
+            context_engine_id: &envelope.context_engine_id,
+            context_name: &envelope.context_name,
+        },
         &response_pdu,
+        user,
+        local_engine,
+        codec,
+        engine_time,
+    )
+}
+
+/// The request-side context a USM RESPONSE echoes back: the decoded message
+/// header plus the ScopedPDU's contextEngineID/contextName (RFC 3412 §7.2.4).
+pub struct V3ResponseContext<'a> {
+    /// The decoded request message header.
+    pub view: &'a V3Message,
+    /// The request's contextEngineID (echoed verbatim).
+    pub context_engine_id: &'a [u8],
+    /// The request's contextName (echoed verbatim).
+    pub context_name: &'a [u8],
+}
+
+/// Encodes a USM RESPONSE for a received v3 message: the request's msg-id,
+/// contextEngineID/contextName, and security level (auth/priv bits) are
+/// echoed, and the response is stamped under `local_engine`'s authority.
+///
+/// Shared by the inform ack path (notify/v3.py:441–508) and the responder's
+/// v3 answer path — the two differ only in which PDU is wrapped.
+pub fn encode_v3_response(
+    context: &V3ResponseContext<'_>,
+    response_pdu: &Pdu,
+    user: &UsmUser,
+    local_engine: &UsmLocalEngine,
+    codec: &UsmModel,
+    engine_time: Option<u32>,
+) -> Result<Vec<u8>, Error> {
+    let flags = context.view.msg_flags;
+    validate_security_level(flags, user)?;
+
+    let msg_data = encode_scoped_pdu(
+        context.context_engine_id,
+        context.context_name,
+        response_pdu,
     )?;
 
     let effective_engine_time = engine_time.unwrap_or(local_engine.engine_time);
@@ -276,7 +333,7 @@ pub fn encode_inform_response(
         priv_params,
     };
     let raw = encode_v3_message(
-        envelope.view.msg_id,
+        context.view.msg_id,
         MAX_MSG_SIZE,
         flags & (MSG_FLAG_AUTH | MSG_FLAG_PRIV),
         &usm,
