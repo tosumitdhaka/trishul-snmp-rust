@@ -269,10 +269,12 @@ impl SnmpResponder {
 
     /// The payload texts of the most recent handler panics, oldest first,
     /// bounded by `RECENT_PANICS_CAP` (older entries are dropped). Each
-    /// drained message corresponds to one [`SnmpResponder::panic_count`]
-    /// increment — the raw `&str`/`String` the panicking handler panicked
-    /// with (or a generic placeholder for non-string payloads). Intended for
-    /// diagnostics: pairing the count with *what* panicked.
+    /// message corresponds to one [`SnmpResponder::panic_count`] increment —
+    /// the raw `&str`/`String` the panicking handler panicked with (or a
+    /// generic placeholder for non-string payloads). Returns a
+    /// non-destructive snapshot (repeated calls return the same messages
+    /// until newer panics push them out); intended for diagnostics: pairing
+    /// the count with *what* panicked.
     #[must_use]
     pub fn recent_panics(&self) -> Vec<String> {
         self.recent_panics

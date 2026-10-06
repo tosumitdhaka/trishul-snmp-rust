@@ -11,7 +11,7 @@
 //! cargo run -- trap --host 127.0.0.1 --port <printed port> 1.3.6.1.6.3.1.1.5.3
 //! ```
 
-use trishul_snmp::notify::listener::{ListenerConfig, NotificationListener};
+use trishul_snmp::{ListenerConfig, NotificationListener};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

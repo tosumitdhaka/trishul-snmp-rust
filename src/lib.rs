@@ -14,8 +14,9 @@
 //! #![allow(unused_imports)]
 //! # fn main() {}
 //! use trishul_snmp::{
-//!     decode_notification, Error, MibBundle, Manager, NotificationListener, Notifier, Oid,
-//!     SnmpResponder, SnmpValue, Target, V1Config, V2cConfig, V3Config, VarBind, WalkOptions,
+//!     decode_notification, Error, ListenerConfig, MibBundle, Manager, NotificationListener,
+//!     Notifier, Oid, SnmpResponder, SnmpValue, Target, V1Config, V2cConfig, V3Config, VarBind,
+//!     WalkOptions,
 //! };
 //! ```
 
@@ -41,7 +42,7 @@ pub use crate::manager::walk::WalkOptions;
 pub use crate::manager::{Manager, V1Config, V2cConfig};
 pub use crate::mib::MibBundle;
 pub use crate::notify::decode_notification;
-pub use crate::notify::listener::NotificationListener;
+pub use crate::notify::listener::{ListenerConfig, NotificationListener};
 pub use crate::notify::sender::Notifier;
 pub use crate::responder::SnmpResponder;
 pub use crate::security::usm::V3Config;

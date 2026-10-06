@@ -11,9 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Ergonomic root re-exports**: `Manager`, `V1Config`, `V2cConfig`, `V3Config`,
   `WalkOptions`, `Error`, `Oid`, `SnmpValue`, `VarBind`, `Target`, `MibBundle`,
-  `Notifier`, `NotificationListener`, `decode_notification`, and `SnmpResponder`
-  are importable directly from the crate root (`use trishul_snmp::Manager`). The
-  full module paths remain valid.
+  `ListenerConfig`, `Notifier`, `NotificationListener`, `decode_notification`,
+  and `SnmpResponder` are importable directly from the crate root
+  (`use trishul_snmp::Manager`). The full module paths remain valid.
 - **Benchmarks**: reproducible comparison scripts against the Python reference
   (CLI-level, library-level, agent-floor decomposition, codec microbench,
   resource usage) under `benchmarks/`, with the measured results documented in
