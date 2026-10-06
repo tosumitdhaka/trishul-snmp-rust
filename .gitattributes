@@ -1,0 +1,3 @@
+# Fixture generator scripts are Python-reference reproducibility tooling,
+# not part of the crate — excluded from language statistics.
+fixtures/**/*.py linguist-vendored
