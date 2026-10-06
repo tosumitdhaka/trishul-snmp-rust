@@ -26,16 +26,18 @@
 //!
 //! - **Binary path**: `env!("CARGO_BIN_EXE_tsnmp")` — cargo sets it for
 //!   integration tests when the crate declares the `tsnmp` bin.
-//! - **Port selection**: deterministic fixed-base allocation. Every test
-//!   binds its responder/listener (or targets one) on a unique port from a
-//!   fixed base range via an atomic counter, so tests run in parallel without
-//!   colliding while the CLI is always given an explicit numeric port
-//!   ("fixed port" in the plan's sense — no OS-assigned port parsing). When
-//!   the base is held by another run of the suite, a pre-flight probe shifts
-//!   the base to an OS-assigned port (conformance pattern). The probe is a
-//!   bind-check-then-rebind, so two suites starting simultaneously can both
-//!   pass it and briefly share the base — accepted precedent, same as the
-//!   conformance suite (TOCTOU; see `suite_port_base`).
+//! - **Port selection**: OS-assigned at bind time (race-free). Every
+//!   in-process responder/listener binds port 0 and the test reads the actual
+//!   port back via `local_addr().port()` before building the CLI args — there
+//!   is no fixed port base and no bind-check-then-rebind probe, so parallel
+//!   test binaries can never collide on a deterministic port (a former
+//!   fixed-base 21500 collision surfaced in CI and was removed). The one
+//!   exception is the `listen` subprocess tests: there the port is a CLI
+//!   argument consumed by the child before it binds, and the CLI does not
+//!   report its bound address, so the test reserves an OS-assigned port first
+//!   (bind 0, read, release) and the child rebinds it — no deterministic
+//!   component remains, and the residual release-then-rebind window is
+//!   documented on [`reserved_port`].
 //! - **Blocking calls**: subprocess spawns run through
 //!   `tokio::task::spawn_blocking` so the in-process responder/listener tasks
 //!   keep being polled on the executor while the CLI runs.
@@ -49,8 +51,6 @@ use std::io::BufRead;
 use std::net::Ipv4Addr;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use common::agent::{AgentReply, FakeAgent};
@@ -78,48 +78,21 @@ use trishul_snmp::types::varbind::VarBind;
 /// The crate version (Cargo.toml), pinned by the `version` command test.
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Fixed port-base for the CLI suite. Tests allocate unique ports from this
-/// range with an atomic counter; the conformance suite already owns the
-/// 1161/1162/1171/1173/1174 range and loopback ephemeral ports are used
-/// everywhere else, so 21500+ is collision-free.
-const PORT_BASE: u16 = 21500;
-const PORT_RANGE: u16 = 1000;
-static NET_PORT: AtomicU16 = AtomicU16::new(0);
-
-/// The suite port base, resolved once per process (conformance pre-flight
-/// probe pattern, tests/conformance/snmpd.rs:115–129): the preferred
-/// [`PORT_BASE`] when free, otherwise an OS-assigned base. A second concurrent
-/// run of the suite that already holds 21500+ therefore gets a disjoint base
-/// instead of colliding on the deterministic ports.
+/// Reserves an OS-assigned loopback port for a server that must be told its
+/// port *before* binding — the `listen` subprocess tests, where the CLI
+/// consumes `--port` before binding and does not report its bound address.
 ///
-/// TOCTOU note (accepted precedent, same as conformance): this is a
-/// bind-check-then-rebind probe — the bind here succeeds, the socket is
-/// dropped, and the actual responder/listener binds afterwards. Two suites
-/// starting simultaneously can both pass the probe and briefly share the
-/// base; the collision window is tiny and the deterministic ports are never
-/// left half-allocated.
-fn suite_port_base() -> u16 {
-    static BASE: OnceLock<u16> = OnceLock::new();
-    *BASE.get_or_init(|| {
-        if std::net::UdpSocket::bind(("127.0.0.1", PORT_BASE)).is_ok() {
-            PORT_BASE
-        } else {
-            eprintln!(
-                "cli: base port {PORT_BASE} is held by another process; \
-                 allocating from an OS-assigned base"
-            );
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .expect("bind ephemeral probe")
-                .local_addr()
-                .expect("probe has an address")
-                .port()
-        }
-    })
-}
-
-/// The next deterministic fixed port for this suite.
-fn fixed_port() -> u16 {
-    suite_port_base() + NET_PORT.fetch_add(1, Ordering::Relaxed) % PORT_RANGE
+/// The probe binds port 0, reads the assigned port, and releases it; the child
+/// process then rebinds it. Unlike the fixed-base machinery this replaces,
+/// there is no deterministic cross-process collision (two parallel binaries
+/// get disjoint OS-assigned ports), but the release-then-rebind window is
+/// inherent to subprocess servers that cannot report their own port.
+fn reserved_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind port probe")
+        .local_addr()
+        .expect("probe has an address")
+        .port()
 }
 
 /// The built binary under test (set by cargo for integration tests).
@@ -193,16 +166,17 @@ fn outcome(output: Output) -> CliOutcome {
     }
 }
 
-/// Binds a responder on `port` and drives its serve loop on the executor.
+/// Binds a responder on an OS-assigned loopback port and drives its serve loop
+/// on the executor. Callers read the actual port back via
+/// [`SnmpResponder::local_addr`].
 async fn spawn_responder(
-    port: u16,
     communities: Option<&[&str]>,
     objects: Vec<(Oid, SnmpValue)>,
 ) -> std::sync::Arc<SnmpResponder> {
     let responder = std::sync::Arc::new(
         SnmpResponder::bind(ResponderConfig {
             host: "127.0.0.1".to_string(),
-            port,
+            port: 0,
             communities: communities
                 .map(|list| list.iter().map(|s| s.as_bytes().to_vec()).collect()),
             objects: object_inputs(objects),
@@ -218,11 +192,12 @@ async fn spawn_responder(
     responder
 }
 
-/// Binds a v2c listener on `port`.
-async fn spawn_v2c_listener(port: u16) -> NotificationListener {
+/// Binds a v2c listener on an OS-assigned loopback port. Callers read the
+/// actual port back via [`NotificationListener::local_addr`].
+async fn spawn_v2c_listener() -> NotificationListener {
     NotificationListener::bind(ListenerConfig {
         host: "127.0.0.1".to_string(),
-        port,
+        port: 0,
         ..Default::default()
     })
     .await
@@ -534,13 +509,12 @@ fn cli_translate_unknown_symbol_exits_1() {
 
 #[tokio::test]
 async fn cli_get_renders_text() {
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         Some(&["public"]),
         vec![(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(123))],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -560,9 +534,7 @@ async fn cli_get_renders_text() {
 async fn cli_get_renders_text_and_uses_bundle() {
     // ← test_cli_get_renders_text_and_uses_bundle: pinned output string.
     let (bundle, _dir) = write_if_mib_bundle();
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         Some(&["public"]),
         vec![(
             oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
@@ -570,6 +542,7 @@ async fn cli_get_renders_text_and_uses_bundle() {
         )],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -589,9 +562,7 @@ async fn cli_get_renders_text_and_uses_bundle() {
 #[tokio::test]
 async fn cli_get_numeric_flag_forces_numeric_oids() {
     let (bundle, _dir) = write_if_mib_bundle();
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         Some(&["public"]),
         vec![(
             oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
@@ -599,6 +570,7 @@ async fn cli_get_numeric_flag_forces_numeric_oids() {
         )],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -618,13 +590,12 @@ async fn cli_get_numeric_flag_forces_numeric_oids() {
 
 #[tokio::test]
 async fn cli_get_json_output() {
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         None,
         vec![(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(55))],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -648,9 +619,7 @@ async fn cli_get_json_output() {
 
 #[tokio::test]
 async fn cli_get_v1_uses_v1_community() {
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         Some(&["public"]),
         vec![(
             oid(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
@@ -658,6 +627,7 @@ async fn cli_get_v1_uses_v1_community() {
         )],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -678,13 +648,12 @@ async fn cli_get_v1_uses_v1_community() {
 async fn cli_get_v3_authnopriv_discovers_and_gets() {
     // ← test_cli_get_v3_uses_v3manager: the constructor wiring is replaced by
     // the real discovery + request flow against the responder's v3 path.
-    let port = fixed_port();
-    spawn_responder_v3(
-        port,
+    let responder = spawn_responder_v3(
         vec![(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(7))],
         cli_v3_auth_user("alice"),
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -711,13 +680,12 @@ async fn cli_get_v3_authnopriv_discovers_and_gets() {
 async fn cli_get_v3_authkey_env_reads_the_named_variable() {
     // ← test_parse_cli_security_builds_v3_authpriv_from_env: the user names an
     // environment variable and the CLI reads the passphrase from it.
-    let port = fixed_port();
-    spawn_responder_v3(
-        port,
+    let responder = spawn_responder_v3(
         vec![(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(3))],
         cli_v3_auth_user("alice"),
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async_with_env(
         &[
@@ -747,21 +715,19 @@ async fn cli_get_v3_authkey_env_reads_the_named_variable() {
 async fn cli_get_v3_accepts_sha2_and_reeder_protocols() {
     // ← test_cli_get_v3_accepts_sha2_and_reeder_protocols: sha512 + 3des-ede
     // end-to-end through the responder.
-    let user = UsmUser::new(
-        "alice".to_string(),
-        AuthProtocol::Sha512,
-        AuthKey::Passphrase(b"authpassword12345".to_vec()),
-        PrivProtocol::Des3Ede,
-        PrivKey::Passphrase(b"privpassword12345".to_vec()),
-    )
-    .expect("valid v3 user");
-    let port = fixed_port();
-    spawn_responder_v3(
-        port,
+    let responder = spawn_responder_v3(
         vec![(oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), SnmpValue::TimeTicks(4))],
-        user,
+        UsmUser::new(
+            "alice".to_string(),
+            AuthProtocol::Sha512,
+            AuthKey::Passphrase(b"authpassword12345".to_vec()),
+            PrivProtocol::Des3Ede,
+            PrivKey::Passphrase(b"privpassword12345".to_vec()),
+        )
+        .expect("valid v3 user"),
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "get",
@@ -817,12 +783,14 @@ async fn cli_get_timeout_failure_exits_1() {
 
 #[tokio::test]
 async fn cli_get_symbolic_target_without_bundle_exits_1() {
+    // No socket is bound in this test: target normalization fails before any
+    // connect, so the port is a neutral literal that is never reached.
     let outcome = run_async(&[
         "get",
         "--host",
         "127.0.0.1",
         "--port",
-        &fixed_port().to_string(),
+        "161",
         "IF-MIB::ifDescr.1",
     ])
     .await;
@@ -840,9 +808,7 @@ async fn cli_get_symbolic_target_without_bundle_exits_1() {
 
 #[tokio::test]
 async fn cli_getnext_returns_successor() {
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         None,
         vec![
             (
@@ -856,6 +822,7 @@ async fn cli_getnext_returns_successor() {
         ],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "getnext",
@@ -875,9 +842,7 @@ async fn cli_getnext_returns_successor() {
 #[tokio::test]
 async fn cli_getbulk_json_output() {
     // ← test_cli_getbulk_json_output: pinned payload fields.
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         None,
         vec![(
             oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
@@ -885,6 +850,7 @@ async fn cli_getbulk_json_output() {
         )],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "getbulk",
@@ -909,9 +875,7 @@ async fn cli_getbulk_json_output() {
 
 #[tokio::test]
 async fn cli_getbulk_text_output() {
-    let port = fixed_port();
-    spawn_responder(
-        port,
+    let responder = spawn_responder(
         None,
         vec![(
             oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
@@ -919,6 +883,7 @@ async fn cli_getbulk_text_output() {
         )],
     )
     .await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "getbulk",
@@ -976,8 +941,8 @@ fn assert_walk_lines(outcome: &CliOutcome) {
 #[tokio::test]
 async fn cli_walk_no_bulk_uses_getnext() {
     // ← test_cli_walk_and_bulkwalk_flags: `--no-bulk` flips to GETNET.
-    let port = fixed_port();
-    spawn_responder(port, None, walk_objects()).await;
+    let responder = spawn_responder(None, walk_objects()).await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "walk",
@@ -994,8 +959,8 @@ async fn cli_walk_no_bulk_uses_getnext() {
 
 #[tokio::test]
 async fn cli_walk_bulk_default() {
-    let port = fixed_port();
-    spawn_responder(port, None, walk_objects()).await;
+    let responder = spawn_responder(None, walk_objects()).await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "walk",
@@ -1011,8 +976,8 @@ async fn cli_walk_bulk_default() {
 
 #[tokio::test]
 async fn cli_walk_json_output() {
-    let port = fixed_port();
-    spawn_responder(port, None, walk_objects()).await;
+    let responder = spawn_responder(None, walk_objects()).await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "walk",
@@ -1035,8 +1000,8 @@ async fn cli_walk_json_output() {
 #[tokio::test]
 async fn cli_bulkwalk_max_repetitions() {
     // ← test_cli_walk_and_bulkwalk_flags: `--max-repetitions` threads through.
-    let port = fixed_port();
-    spawn_responder(port, None, walk_objects()).await;
+    let responder = spawn_responder(None, walk_objects()).await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "bulkwalk",
@@ -1054,8 +1019,8 @@ async fn cli_bulkwalk_max_repetitions() {
 
 #[tokio::test]
 async fn cli_walk_v1_downgrades_to_getnext() {
-    let port = fixed_port();
-    spawn_responder(port, Some(&["public"]), walk_objects()).await;
+    let responder = spawn_responder(Some(&["public"]), walk_objects()).await;
+    let port = responder.local_addr().port();
 
     let outcome = run_async(&[
         "walk",
@@ -1121,8 +1086,8 @@ async fn cli_bulkwalk_surfaces_walk_error_exit_code() {
 
 #[tokio::test]
 async fn cli_trap_v2c_sends_and_prints_request_id() {
-    let port = fixed_port();
-    let listener = spawn_v2c_listener(port).await;
+    let listener = spawn_v2c_listener().await;
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "trap",
@@ -1172,8 +1137,8 @@ async fn cli_trap_parses_typed_varbinds() {
     // ← test_cli_trap_parses_typed_varbinds: OID=TYPE:VALUE parsing, incl.
     // symbolic `oid:` resolution through the bundle.
     let (bundle, _dir) = write_notif_mib_bundle();
-    let port = fixed_port();
-    let listener = spawn_v2c_listener(port).await;
+    let listener = spawn_v2c_listener().await;
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "trap",
@@ -1245,11 +1210,10 @@ async fn cli_trap_v3_sends_with_local_engine() {
     // ← test_cli_trap_v3_routes_to_v3notifier: the local engine state reaches
     // the wire (the listener reports the authoritative engine id).
     let user = cli_v3_auth_user("alice");
-    let port = fixed_port();
     let listener = V3NotificationListener::bind(
         ListenerConfig {
             host: "127.0.0.1".to_string(),
-            port,
+            port: 0,
             ..Default::default()
         },
         user,
@@ -1257,6 +1221,7 @@ async fn cli_trap_v3_sends_with_local_engine() {
     )
     .await
     .expect("bind v3 listener");
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "trap",
@@ -1304,8 +1269,8 @@ async fn cli_trap_v3_sends_with_local_engine() {
 async fn cli_trap_v1_routes_full_fields() {
     // ← test_cli_trap_v1_routes_to_v1notifier: all Trap-PDU fields reach the
     // wire; stdout is the timestamp.
-    let port = fixed_port();
-    let listener = spawn_v2c_listener(port).await;
+    let listener = spawn_v2c_listener().await;
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "trap",
@@ -1348,8 +1313,8 @@ async fn cli_trap_v1_routes_full_fields() {
 #[tokio::test]
 async fn cli_trap_v1_applies_default_trap_fields() {
     // ← test_cli_trap_v1_applies_default_trap_fields.
-    let port = fixed_port();
-    let listener = spawn_v2c_listener(port).await;
+    let listener = spawn_v2c_listener().await;
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "trap",
@@ -1493,8 +1458,8 @@ fn cli_trap_rejects_unsupported_value_type() {
 async fn cli_inform_v2c_renders_response() {
     // ← test_cli_inform_renders_response: the listener acks; the CLI prints
     // the response varbinds.
-    let port = fixed_port();
-    let listener = spawn_v2c_listener(port).await;
+    let listener = spawn_v2c_listener().await;
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "inform",
@@ -1527,11 +1492,10 @@ async fn cli_inform_v3_discovers_and_acks() {
     // ← test_cli_inform_v3_routes_to_v3notifier: the v3 listener answers the
     // discovery probe and acks the inform.
     let user = cli_v3_auth_user("alice");
-    let port = fixed_port();
     let listener = V3NotificationListener::bind(
         ListenerConfig {
             host: "127.0.0.1".to_string(),
-            port,
+            port: 0,
             ..Default::default()
         },
         user,
@@ -1539,6 +1503,7 @@ async fn cli_inform_v3_discovers_and_acks() {
     )
     .await
     .expect("bind v3 listener");
+    let port = listener.local_addr().port();
 
     let outcome = run_async(&[
         "inform",
@@ -1634,7 +1599,7 @@ fn cli_listen_receives_configured_count() {
     // ← test_cli_listen_receives_configured_count: bounded by --count 1. The
     // event renders across multiple lines; keep sending until the process
     // exits, then assert the joined output.
-    let port = fixed_port();
+    let port = reserved_port();
     let child = StreamingChild::spawn(&[
         "listen",
         "--host",
@@ -1660,7 +1625,7 @@ fn cli_listen_receives_configured_count() {
 fn cli_listen_v1_uses_community_listener() {
     // ← test_cli_listen_v1_uses_community_listener: `--snmp-version 1` routes
     // to the community listener and v1 Trap-PDU metadata renders.
-    let port = fixed_port();
+    let port = reserved_port();
     let child = StreamingChild::spawn(&[
         "listen",
         "--host",
@@ -1693,7 +1658,7 @@ fn cli_listen_v3_receives_authnopriv_trap() {
     // ← test_cli_listen_v3_uses_v3_listener: the v3 listener surfaces the
     // user/level header.
     let user = cli_v3_auth_user("alice");
-    let port = fixed_port();
+    let port = reserved_port();
     let child = StreamingChild::spawn(&[
         "listen",
         "--host",
@@ -1732,7 +1697,7 @@ fn cli_listen_v3_receives_authnopriv_trap() {
 fn cli_listen_runs_until_interrupted() {
     // Bounded-runtime test of the run-until-interrupted path: spawn without
     // --count, receive one event, terminate the process.
-    let port = fixed_port();
+    let port = reserved_port();
     let mut child =
         StreamingChild::spawn(&["listen", "--host", "127.0.0.1", "--port", &port.to_string()]);
     let line = wait_for_event_line(&child, || send_udp(port, &v2c_trap("public", 9, None)));
@@ -1747,7 +1712,8 @@ fn cli_listen_runs_until_interrupted() {
 
 #[test]
 fn cli_listen_json_emits_one_object_per_line() {
-    let port = fixed_port();
+    // ← test_cli_listen_json_emits_one_object_per_line.
+    let port = reserved_port();
     let child = StreamingChild::spawn(&[
         "listen",
         "--host",
@@ -2110,14 +2076,9 @@ fn cli_get_v1_rejects_context_name() {
 
 #[test]
 fn cli_get_rejects_unknown_target_format() {
-    let outcome = run(&[
-        "get",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &fixed_port().to_string(),
-        "not-an-oid",
-    ]);
+    // No socket is bound in this test: target parsing fails before any
+    // connect, so the port is a neutral literal that is never reached.
+    let outcome = run(&["get", "--host", "127.0.0.1", "--port", "161", "not-an-oid"]);
     assert_eq!(outcome.code, 1);
     assert!(
         outcome.stderr.contains("Unrecognized target format"),
@@ -2133,12 +2094,18 @@ fn hex_string(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Binds a responder with the v3 answer path enabled on `port`.
-async fn spawn_responder_v3(port: u16, objects: Vec<(Oid, SnmpValue)>, user: UsmUser) {
+/// Binds a responder with the v3 answer path enabled on an OS-assigned
+/// loopback port; callers read the actual port back via
+/// [`SnmpResponder::local_addr`]. USM identity is the engineID, not the port
+/// (Phase 7 finding), so an OS-assigned port is safe for the v3 users.
+async fn spawn_responder_v3(
+    objects: Vec<(Oid, SnmpValue)>,
+    user: UsmUser,
+) -> std::sync::Arc<SnmpResponder> {
     let responder = std::sync::Arc::new(
         SnmpResponder::bind(ResponderConfig {
             host: "127.0.0.1".to_string(),
-            port,
+            port: 0,
             objects: object_inputs(objects),
             v3: Some((user, local_engine(1000))),
             ..Default::default()
@@ -2150,6 +2117,7 @@ async fn spawn_responder_v3(port: u16, objects: Vec<(Oid, SnmpValue)>, user: Usm
     tokio::spawn(async move {
         serve.serve(0).await.expect("serve loop");
     });
+    responder
 }
 
 /// Converts `(Oid, SnmpValue)` seeds to responder `ObjectInput`s.
