@@ -5,7 +5,7 @@
 //! conflicts: the reference parses everything with argparse and validates in
 //! `parse_cli_security`/`validate_trap_version_flags` (common.py), surfacing
 //! `tsnmp: <message>` with exit code 1. Porting that behavior verbatim keeps
-//! the pinned error strings and exit codes (docs/architecture.md §5.9); clap
+//! the pinned error strings and exit codes (docs/cli.md; §8 deviations); clap
 //! stays permissive and `cli/common.rs` validates.
 //!
 //! `--auth-key-env`/`--priv-key-env` take a VARNAME: the passphrase is read

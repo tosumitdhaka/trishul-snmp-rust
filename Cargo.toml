@@ -9,7 +9,15 @@ repository = "https://github.com/tosumitdhaka/trishul-snmp-rust"
 readme = "README.md"
 keywords = ["snmp", "network", "monitoring", "mib", "usm"]
 categories = ["network-programming", "asynchronous"]
-exclude = [".cortexkit/"]
+# tests/, fixtures/, and docs/ ship in the package so downstream `cargo test`
+# works (fixtures are read via CARGO_MANIFEST_DIR); repo-only tooling is
+# excluded.
+exclude = [
+    ".cortexkit/",
+    ".github/",
+    "fixtures/wire-golden/generate.py",
+    "fixtures/3des-datagram/generate.py",
+]
 
 [[bin]]
 name = "tsnmp"

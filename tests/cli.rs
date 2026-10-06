@@ -372,6 +372,16 @@ impl StreamingChild {
     }
 }
 
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        // Kill-on-drop: a failed assertion between spawn and the explicit
+        // kill()/wait() must not leak the tsnmp process.
+        if self.child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+            let _ = self.child.kill();
+        }
+    }
+}
+
 /// Drives a count-bounded listen subprocess: repeatedly sends `send` until
 /// the child exits (it exits after printing the whole event), then returns
 /// its exit code and every stdout line.

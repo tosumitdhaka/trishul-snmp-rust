@@ -101,6 +101,7 @@ trishul-snmp-rust/
 │   └── cli/
 │       ├── mod.rs                # run() entry                  (← cli/main.py)
 │       ├── args.rs                # clap definitions + env secrets (← cli/main.py + common.py)
+│       ├── common.rs              # shared plumbing: security/secrets/varbinds (← cli/common.py)
 │       └── output.rs             # text/JSON renderers           (← cli/output.py)
 ├── src/bin/tsnmp.rs              # thin bin: calls trishul_snmp::cli::run()
 ├── tests/                        # see docs/plan.md §Test architecture
@@ -625,3 +626,5 @@ state, which tokio cannot provide.
 | `tsnmp` is the only installed binary | both `tsnmp` and `trishul-snmp` console scripts (pyproject) | Cargo declares the single `tsnmp` bin; the reference's pyproject console-script pin is not portable |
 | CLI tests run the binary as a subprocess against in-process responder/listener on deterministic fixed-base ports | pytest `main([...])` with monkeypatched managers/notifiers | The plan's subprocess-test design replaces the reference's 57 monkeypatch/patch sites while preserving the pinned output strings (`tests/cli.rs`) |
 | CLI `version` subcommand prints the crate version | prints the package `__version__` | Identical surface; the value source differs (`src/cli/mod.rs` `handle_version`) |
+| CLI trap `--agent-addr` parses to `Ipv4Addr` at parse time | `IpAddressValue` stores a raw string, validated at encode | Same category as the varbind `ip` row above; "Invalid agent address: …" message (`src/cli/mod.rs`) |
+| Output renderer keeps an empty `Some("")` display value as the empty string | Python's `or` treats `""` as falsy and falls back to the raw display | Unreachable in practice (no reference path produces an empty display string); documented for exactness (`src/cli/output.rs`) |

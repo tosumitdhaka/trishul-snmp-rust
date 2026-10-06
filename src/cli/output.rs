@@ -1,7 +1,7 @@
 //! Text/JSON renderers (← cli/output.py)
 //!
 //! stdout shapes are the pinned CLI contract: every string here matches the
-//! reference's output.py byte-for-byte (docs/architecture.md §5.9). The JSON
+//! reference's output.py byte-for-byte (docs/cli.md). The JSON
 //! payloads reproduce `_response_payload`, `_varbind_payload`, and
 //! `_notification_payload`; key insertion order is irrelevant (JSON objects
 //! compare by key), but key presence/absence and values are exact.
