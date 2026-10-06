@@ -182,9 +182,21 @@ fn module_paths_from_manifest(
     for entry in modules {
         let file_name = manifest_module_filename(entry, manifest_path)?;
         let module_path = bundle_dir.join(&file_name);
-        let resolved =
-            fs::canonicalize(&module_path).unwrap_or_else(|_| lexical_resolve(&module_path));
-        if !resolved.starts_with(&bundle_dir_resolved) {
+        let (resolved, base) = match fs::canonicalize(&module_path) {
+            Ok(canonical) => (canonical, bundle_dir_resolved.clone()),
+            Err(_) => (
+                // The module file does not exist, so it cannot be
+                // canonicalized; compare lexically on BOTH sides. Platforms
+                // where the bundle path resolves differently through
+                // canonicalize (macOS /var -> /private/var; Windows short
+                // names + \\?\ verbatim prefix) would otherwise reject valid
+                // in-bundle references. lexical_resolve collapses `..`, so
+                // the traversal rejection below is unchanged.
+                lexical_resolve(&module_path),
+                lexical_resolve(bundle_dir),
+            ),
+        };
+        if !resolved.starts_with(&base) {
             return Err(BundleError::Validation {
                 path: manifest_path.display().to_string(),
                 message: "Manifest module file must stay within the bundle directory".to_string(),

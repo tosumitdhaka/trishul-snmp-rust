@@ -499,6 +499,35 @@ fn manifest_symlink_escape_is_rejected() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn missing_module_file_through_symlinked_bundle_dir_reports_missing_not_escape() {
+    use std::os::unix::fs::symlink;
+
+    // Regression, caught live by the macOS/Windows CI matrix: a module
+    // file that does not exist falls back to lexical resolution while the
+    // bundle dir is canonicalized. On platforms where the two forms differ
+    // (macOS /var -> /private/var; Windows short names + \\?\ prefix), the
+    // containment check rejected valid in-bundle references. Loading
+    // through a symlinked path reproduces the asymmetry on unix.
+    let tmp = TempDir::new("mib-manifest-symdir");
+    write_json(
+        &tmp.path().join("manifest.json"),
+        &json!({"modules": ["MISSING.json"]}),
+    );
+    let link = TempDir::new("mib-manifest-symlink");
+    // Replace the (empty) link dir with a symlink to the real bundle dir.
+    std::fs::remove_dir(link.path()).unwrap();
+    symlink(tmp.path(), link.path()).unwrap();
+
+    let err = load_bundle(link.path()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Manifest references a missing module file"),
+        "{err}"
+    );
+}
+
 #[test]
 fn oid_index_validation_errors() {
     let tmp = TempDir::new("oididx");
