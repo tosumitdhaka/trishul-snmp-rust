@@ -1,0 +1,16 @@
+[package]
+name = "tsnmp"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Alias crate: tsnmp and trishul-snmp are the same Rust SNMP toolkit (manager v1/v2c/v3, notifications, responder, MIB, CLI)"
+repository = "https://github.com/tosumitdhaka/trishul-snmp-rust"
+readme = "README.md"
+keywords = ["snmp", "snmpv3", "network", "monitoring", "async"]
+categories = ["network-programming"]
+
+[dependencies]
+# Path for local dev; crates.io resolves the version requirement when the
+# alias is published (the workflow publishes trishul-snmp first).
+trishul-snmp = { path = "../..", version = "0.1.1" }

@@ -14,9 +14,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Test before publishing
-        run: cargo test --all
+        run: |
+          cargo test --all
+          cargo check --manifest-path crates/tsnmp/Cargo.toml --all-targets
 
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+      - name: Publish tsnmp alias crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --manifest-path crates/tsnmp/Cargo.toml

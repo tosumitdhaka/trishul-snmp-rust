@@ -16,6 +16,7 @@ exclude = [
     ".cortexkit/",
     ".github/",
     "benchmarks/",
+    "crates/",
     "fixtures/wire-golden/generate.py",
     "fixtures/3des-datagram/generate.py",
 ]

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tsnmp` alias crate**: `tsnmp` and `trishul-snmp` on crates.io are the
+  same project — both names resolve to this toolkit and both install the
+  same `tsnmp` CLI binary. Published in lockstep; the canonical name
+  remains `trishul-snmp`.
+
 - **Ergonomic root re-exports**: `Manager`, `V1Config`, `V2cConfig`, `V3Config`,
   `WalkOptions`, `Error`, `Oid`, `SnmpValue`, `VarBind`, `Target`, `MibBundle`,
   `ListenerConfig`, `Notifier`, `NotificationListener`, `decode_notification`,

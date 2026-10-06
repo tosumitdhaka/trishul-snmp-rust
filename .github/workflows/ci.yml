@@ -24,6 +24,7 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path crates/tsnmp/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})

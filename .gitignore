@@ -1,3 +1,5 @@
 /target
 .cortexkit/
 benchmarks/tsnmp-bench/target/
+crates/tsnmp/target/
+crates/tsnmp/Cargo.lock
