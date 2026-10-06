@@ -1,8 +1,8 @@
-//! Smoke test: proves the library links and the crate version is 0.1.0.
+//! Smoke test: proves the library links and `VERSION` mirrors Cargo.toml.
 
 #[test]
-fn crate_version_is_0_1_0() {
-    assert_eq!(trishul_snmp::VERSION, "0.1.0");
+fn crate_version_matches_manifest() {
+    assert_eq!(trishul_snmp::VERSION, env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

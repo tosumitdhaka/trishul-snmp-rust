@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-06
+
+### Added
+
+- **Ergonomic root re-exports**: `Manager`, `V1Config`, `V2cConfig`, `V3Config`,
+  `WalkOptions`, `Error`, `Oid`, `SnmpValue`, `VarBind`, `Target`, `MibBundle`,
+  `Notifier`, `NotificationListener`, `decode_notification`, and `SnmpResponder`
+  are importable directly from the crate root (`use trishul_snmp::Manager`). The
+  full module paths remain valid.
+- **Benchmarks**: reproducible comparison scripts against the Python reference
+  (CLI-level, library-level, agent-floor decomposition, codec microbench,
+  resource usage) under `benchmarks/`, with the measured results documented in
+  `docs/benchmarks.md`.
+
+### Fixed
+
+- The 0.1.0 entry documented the import path `trishul_snmp::Manager`, which did
+  not resolve in 0.1.0; the root re-exports above make that path real.
+
 ## [0.1.0] - 2026-10-06
 
 ### Added
