@@ -7,9 +7,8 @@ SNMPv1/v2c/v3 (USM), with optional compiled-JSON MIB enrichment.
 - Rust port of the Python `trishul-snmp` reference implementation
   (`/home/dhaka/trishul/trishul-snmp`). The Python library is the reference for the
   *feature surface*; the API shape here is Rust-native.
-- **Status**: Phase 0 complete (skeleton, CI, fixtures, docs); Phase 1 (codec core)
-  reviewed and greenlit. Architecture and plan are finalized (see docs below) and
-  independently reviewed.
+- **Status**: Phase 8 (CLI + release prep) complete — the 11-subcommand `tsnmp`
+  binary, user docs, and publish metadata are in place.
 
 ## Goal
 
@@ -45,6 +44,54 @@ conformance gate as the interop proof.
   error taxonomy, test seams, and deliberate deviations from the Python reference
 - [`docs/plan.md`](docs/plan.md) — phased implementation plan with verification gates,
   test architecture, and risk register
+- [`docs/cli.md`](docs/cli.md) — CLI reference: every subcommand, flag, exit code, and
+  output mode
+
+## CLI usage
+
+The `tsnmp` binary covers SNMPv1, SNMPv2c, and SNMPv3 for polling, notification
+send/listen, and offline decode. Full option tables live in
+[`docs/cli.md`](docs/cli.md).
+
+```bash
+# Build
+cargo build --release
+
+# Version
+tsnmp version
+
+# Polling (v1/v2c/v3): get, getnext, getbulk, walk, bulkwalk
+tsnmp get --host 10.0.0.10 1.3.6.1.2.1.1.3.0
+tsnmp get --host 10.0.0.10 --bundle ./IF-MIB.json IF-MIB::ifDescr.1
+tsnmp get --host 10.0.0.10 --snmp-version 3 --username monitor \
+  --auth-protocol sha256 --auth-key-env TSNMP_AUTH 1.3.6.1.2.1.1.3.0
+tsnmp walk --host 10.0.0.10 1.3.6.1.2.1.2.2
+tsnmp bulkwalk --host 10.0.0.10 --max-repetitions 25 1.3.6.1.2.1.2.2
+
+# Notifications
+tsnmp trap --host 10.0.0.20 1.3.6.1.6.3.1.1.5.3
+tsnmp trap --host 10.0.0.20 --snmp-version 3 --username notify \
+  --local-engine-id 8000010203 --local-engine-boots 7 --local-engine-time 99 \
+  1.3.6.1.6.3.1.1.5.3
+tsnmp inform --host 10.0.0.20 1.3.6.1.6.3.1.1.5.3
+tsnmp listen --host 127.0.0.1 --port 9162 --count 1
+tsnmp listen --snmp-version 3 --username notify \
+  --local-engine-id 8000010203 --local-engine-boots 7 --local-engine-time 99
+
+# Offline decode and translation
+tsnmp decode-notification --hex 302602010104067075626c6963...
+tsnmp translate --bundle ./IF-MIB.json IF-MIB::ifDescr.1
+```
+
+Secrets: `--auth-key-env TSNMP_AUTH` names an environment variable whose value
+is the passphrase — the secret never appears on the command line.
+
+Output defaults to line-oriented text (`NAME = VALUE`); `--json` switches to
+machine-readable JSON, and `--numeric` forces numeric OIDs even when a bundle
+is loaded.
+
+Exit codes: `0` success, `1` runtime/translation/protocol failure or non-zero
+SNMP error status, `2` invalid CLI usage.
 
 ## Ecosystem position
 

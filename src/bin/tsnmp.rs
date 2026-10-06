@@ -1,4 +1,5 @@
+//! Thin bin: calls trishul_snmp::cli::run() (docs/architecture.md §4).
+
 fn main() {
-    eprintln!("tsnmp: under construction");
-    std::process::exit(2);
+    std::process::exit(trishul_snmp::cli::run());
 }

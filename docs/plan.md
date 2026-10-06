@@ -1,8 +1,9 @@
 # tsnmp Implementation Plan
 
-Status: finalized, pre-implementation. Phases are dependency-ordered and match the
-reference's verified layering (wire → security → transport → session → managers).
-Each phase's verification gate is executable before the next phase starts.
+Status: Phases 0–8 complete (bootstrap through CLI + release prep). All phase
+gates green at HEAD; the Phase 8 gate (CLI subprocess tests, full conformance
+matrix, MSRV check) is the release checkpoint. This document is the contract
+the implementation is built and reviewed against.
 
 ## Verification philosophy
 

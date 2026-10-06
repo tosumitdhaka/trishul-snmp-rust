@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Async SNMP toolkit: manager, notifications, read-only responder, MIB enrichment"
+repository = "https://github.com/tosumitdhaka/trishul-snmp-rust"
+readme = "README.md"
+keywords = ["snmp", "network", "monitoring", "mib", "usm"]
+categories = ["network-programming", "asynchronous"]
+exclude = [".cortexkit/"]
 
 [[bin]]
 name = "tsnmp"
