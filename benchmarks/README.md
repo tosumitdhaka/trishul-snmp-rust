@@ -33,7 +33,8 @@ measured was 0.1.0) — adjust when re-running against a newer release.
    python3 benchmarks/bench_cli.py
    ```
 
-3. Library-level (adjust the interpreter/venv path to the Python reference):
+3. Library-level (run `bench_py_lib.py` with the reference venv's interpreter —
+   it imports `trishul_snmp` directly, no `sys.path` bootstrap):
 
    ```sh
    python3 benchmarks/bench_py_lib.py          # Python side

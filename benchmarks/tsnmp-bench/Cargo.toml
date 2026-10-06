@@ -2,6 +2,7 @@
 name = "bench-rs"
 version = "0.1.0"
 edition = "2024"
+default-run = "bench-rs"
 
 [dependencies]
 trishul-snmp = "0.1.0"
