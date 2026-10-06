@@ -330,7 +330,46 @@ fn lexical_resolve(path: &Path) -> PathBuf {
     out
 }
 
-/// `~`/`~/…` expansion for the bundle path (loader.py:32).
+/// `~`/`~/…` expansion for the bundle path (loader.py:32). On unix the
+/// reference's `Path.expanduser()` `~user` form is also handled (§8); on
+/// non-unix the documented `~`/`~/`-only limitation stays.
+#[cfg(unix)]
+fn expanduser(path: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    expanduser_with(path, home.as_deref(), &passwd)
+}
+
+/// Pure `~`/`~/`/`~user` expansion against explicit HOME and passwd content —
+/// unit-testable with fixture content (no filesystem access).
+#[cfg(unix)]
+fn expanduser_with(path: &Path, home: Option<&Path>, passwd_content: &str) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return match home {
+            Some(home) => home.to_path_buf(),
+            None => path.to_path_buf(),
+        };
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return match home {
+            Some(home) => home.join(rest),
+            None => path.to_path_buf(),
+        };
+    }
+    if let Some(rest) = text.strip_prefix('~') {
+        let (user, remainder) = split_tilde_user(rest);
+        if let Some(home) = passwd_home_for(passwd_content, &user) {
+            return PathBuf::from(home).join(remainder);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// `~`/`~/…` expansion for the bundle path (loader.py:32); the reference's
+/// `~user` form needs the pwd module, so the documented limitation stays on
+/// non-unix (§8).
+#[cfg(not(unix))]
 fn expanduser(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -343,6 +382,32 @@ fn expanduser(path: &Path) -> PathBuf {
         return home.join(rest);
     }
     path.to_path_buf()
+}
+
+/// Splits the text after the leading `~` of a `~user/…` path into the user
+/// name and the path remainder (empty when the path is exactly `~user`).
+#[cfg(unix)]
+fn split_tilde_user(rest: &str) -> (String, &str) {
+    match rest.split_once('/') {
+        Some((user, remainder)) => (user.to_string(), remainder),
+        None => (rest.to_string(), ""),
+    }
+}
+
+/// Looks up `user`'s home directory (passwd field 6) in `/etc/passwd`
+/// `content`. Malformed lines (wrong field count) and empty home fields are
+/// skipped; the first well-formed match wins. `None` when the user is absent —
+/// the caller falls through to the literal path, which `load_bundle` rejects
+/// with "Bundle path does not exist".
+#[cfg(unix)]
+fn passwd_home_for<'a>(content: &'a str, user: &str) -> Option<&'a str> {
+    content.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() != 7 || fields[5].is_empty() {
+            return None;
+        }
+        (fields[0] == user).then_some(fields[5])
+    })
 }
 
 #[cfg(test)]
@@ -361,5 +426,104 @@ mod tests {
             BundleError::Validation { message, .. }
                 if message == "Missing bundle artifact"
         ));
+    }
+
+    #[cfg(unix)]
+    mod expanduser_unix {
+        use super::*;
+
+        /// A fixture `/etc/passwd`-shaped content block.
+        const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+                              alice:x:1000:1000:Alice:/home/alice:/bin/sh\n\
+                              this line is malformed\n\
+                              bob:x:1001:1001::/home/bob:/usr/sbin/nologin\n\
+                              :x:1002:1002:::/bin/false\n";
+
+        fn home(home: &str) -> Option<&Path> {
+            Some(Path::new(home))
+        }
+
+        #[test]
+        fn passwd_home_for_finds_valid_user() {
+            assert_eq!(passwd_home_for(PASSWD, "alice"), Some("/home/alice"));
+            assert_eq!(passwd_home_for(PASSWD, "bob"), Some("/home/bob"));
+        }
+
+        #[test]
+        fn passwd_home_for_skips_malformed_lines() {
+            // The malformed and empty-name lines must not confuse the parse.
+            assert_eq!(passwd_home_for(PASSWD, "bob"), Some("/home/bob"));
+            assert_eq!(passwd_home_for(PASSWD, "root"), Some("/root"));
+        }
+
+        #[test]
+        fn passwd_home_for_unknown_user_is_none() {
+            assert_eq!(passwd_home_for(PASSWD, "ghost"), None);
+        }
+
+        #[test]
+        fn expanduser_known_user_substitutes_home() {
+            assert_eq!(
+                expanduser_with(Path::new("~alice"), home("/home/me"), PASSWD),
+                PathBuf::from("/home/alice")
+            );
+            assert_eq!(
+                expanduser_with(
+                    Path::new("~bob/bundles/IF-MIB.json"),
+                    home("/home/me"),
+                    PASSWD
+                ),
+                PathBuf::from("/home/bob/bundles/IF-MIB.json")
+            );
+        }
+
+        #[test]
+        fn expanduser_unknown_user_falls_through() {
+            // The literal path survives expansion and load_bundle then rejects
+            // it with "Bundle path does not exist" (loader.rs:42–46) — the
+            // reference's behavior for an unknown `~user`.
+            let path = Path::new("~ghost/bundles/IF-MIB.json");
+            assert_eq!(
+                expanduser_with(path, home("/home/me"), PASSWD),
+                path.to_path_buf()
+            );
+            let bare = Path::new("~ghost");
+            assert_eq!(
+                expanduser_with(bare, home("/home/me"), PASSWD),
+                bare.to_path_buf()
+            );
+        }
+
+        #[test]
+        fn expanduser_unreadable_passwd_falls_through() {
+            // An empty /etc/passwd parse (unreadable or absent file) keeps
+            // `~user` literal while `~`/`~/` keep working.
+            assert_eq!(
+                expanduser_with(Path::new("~ghost/mib"), home("/home/me"), ""),
+                PathBuf::from("~ghost/mib")
+            );
+        }
+
+        #[test]
+        fn expanduser_tilde_forms_are_unchanged() {
+            // `~` and `~/…` behave exactly as before: HOME-driven, and literal
+            // when HOME is unset.
+            assert_eq!(
+                expanduser_with(Path::new("~"), home("/home/me"), PASSWD),
+                PathBuf::from("/home/me")
+            );
+            assert_eq!(
+                expanduser_with(Path::new("~/bundles"), home("/home/me"), PASSWD),
+                PathBuf::from("/home/me/bundles")
+            );
+            assert_eq!(
+                expanduser_with(Path::new("~"), None, PASSWD),
+                PathBuf::from("~")
+            );
+            assert_eq!(
+                expanduser_with(Path::new("~/bundles"), None, PASSWD),
+                PathBuf::from("~/bundles")
+            );
+        }
     }
 }

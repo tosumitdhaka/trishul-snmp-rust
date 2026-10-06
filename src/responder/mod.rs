@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -156,6 +157,9 @@ pub struct SnmpResponder {
     v3: Option<V3Responder>,
     cancel: watch::Sender<bool>,
     local_addr: SocketAddr,
+    /// Handler panics caught and isolated by the serve loop (§8 responder
+    /// panic counter; the `responder: …` stderr branch).
+    panic_count: AtomicU64,
 }
 
 impl SnmpResponder {
@@ -222,6 +226,7 @@ impl SnmpResponder {
             v3,
             cancel,
             local_addr,
+            panic_count: AtomicU64::new(0),
         })
     }
 
@@ -242,6 +247,16 @@ impl SnmpResponder {
     #[must_use]
     pub fn is_in_memory(&self) -> bool {
         self.in_memory.is_some()
+    }
+
+    /// Number of handler panics caught and isolated by the serve loop (the
+    /// `responder: …` stderr branch). No silent failure modes: a non-zero
+    /// count means datagrams were dropped to a panic instead of answered —
+    /// the mirror of the listener's `DropCounts` philosophy. Surfacing
+    /// panics through a typed event channel is a post-1.0 candidate.
+    #[must_use]
+    pub fn panic_count(&self) -> u64 {
+        self.panic_count.load(Ordering::Relaxed)
     }
 
     /// Sets an object on the default in-memory source (server.py:157–159).
@@ -282,10 +297,11 @@ impl SnmpResponder {
     /// unrepresentable. Returns the number of handled requests.
     ///
     /// A panic inside a per-datagram handler is caught and logged to stderr
-    /// (`responder: …`), then the loop continues — the responder has no event
-    /// channel to surface into by design (`serve` is the only consumer, unlike
-    /// the listener's `recv`); surfacing panics through a typed channel is a
-    /// post-1.0 candidate.
+    /// (`responder: …`) and counted by [`SnmpResponder::panic_count`], then
+    /// the loop continues — the responder has no event channel to surface
+    /// into by design (`serve` is the only consumer, unlike the listener's
+    /// `recv`); surfacing panics through a typed channel is a post-1.0
+    /// candidate.
     pub async fn serve(&self, count: usize) -> Result<usize, Error> {
         let mut handled = 0usize;
         let mut cancel_rx = self.cancel.subscribe();
@@ -312,8 +328,9 @@ impl SnmpResponder {
                             // loop stays up for the next request (Phase 5
                             // pattern). There is no event channel to surface
                             // into — the responder's `serve` has no `recv`
-                            // counterpart — so the panic is logged and the
-                            // loop continues.
+                            // counterpart — so the panic is logged, counted,
+                            // and the loop continues.
+                            self.panic_count.fetch_add(1, Ordering::Relaxed);
                             eprintln!("responder: {error}");
                         }
                     }
@@ -693,6 +710,76 @@ fn v1_get_next_varbinds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end panic counting: a callback source whose exact lookup panics
+    /// for one OID drives the `run_isolated` Err branch, which increments
+    /// [`SnmpResponder::panic_count`]; a second, well-behaved request is
+    /// answered so `serve(1)` terminates deterministically.
+    #[tokio::test]
+    async fn serve_counts_handler_panics() {
+        let panicking_oid = Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 4242, 1]).expect("valid OID");
+        let safe_oid = Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 4242, 2]).expect("valid OID");
+        let panicking_oid_for_source = panicking_oid.clone();
+        let exact = Arc::new(move |oid: &Oid| {
+            if *oid == panicking_oid_for_source {
+                panic!("injected responder panic");
+            }
+            Some(SnmpValue::Integer(7))
+        });
+        let responder = Arc::new(
+            SnmpResponder::bind(ResponderConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                source: Some(Arc::new(CallbackObjectSource::new(
+                    exact,
+                    Arc::new(|_oid: &Oid| None),
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("bind test responder"),
+        );
+        let serve = {
+            let responder = Arc::clone(&responder);
+            tokio::spawn(async move { responder.serve(1).await })
+        };
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind client socket");
+        let request = |oid: &Oid| {
+            encode_message(&SnmpMessage {
+                version: SnmpVersion::V2c,
+                community: b"public".to_vec(),
+                pdu: Pdu {
+                    kind: PduKind::GetRequest,
+                    request_id: 1,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds: vec![VarBind::new(oid.clone(), SnmpValue::Null)],
+                    v1_trap: None,
+                },
+            })
+            .expect("request encodes")
+        };
+        // The panicking request first (no reply), then a healthy one that
+        // completes the count-bounded serve. `serve(1)` returns only after
+        // both datagrams were processed, so the counter is final.
+        client
+            .send_to(&request(&panicking_oid), responder.local_addr())
+            .await
+            .expect("send panicking request");
+        client
+            .send_to(&request(&safe_oid), responder.local_addr())
+            .await
+            .expect("send healthy request");
+        let handled = serve.await.expect("serve task").expect("serve ok");
+        assert_eq!(handled, 1, "the healthy request was answered");
+        assert_eq!(
+            responder.panic_count(),
+            1,
+            "the panicking datagram was counted, not silently dropped"
+        );
+    }
 
     /// Direct test of the v2c `Err → Dropped` branch (the `Err(_) =>
     /// DatagramOutcome::Dropped` arm of `handle_community`): an unencodable

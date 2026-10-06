@@ -14,6 +14,12 @@ use crate::time::Clock;
 const TIME_WINDOW_SECONDS: f64 = 150.0;
 /// Bounded per-(engine, username) salt cache size (notify/v3.py:72).
 const SALT_CACHE_SIZE: usize = 64;
+/// Maximum number of distinct engine IDs a guard tracks (LRU; §8 bounded
+/// engine tracking). The reference keeps unbounded per-engine dicts
+/// (notify/v3.py:203–204); only noAuthNoPriv traffic reaches the guard (auth
+/// verification precedes it), so rotating engine IDs could otherwise grow the
+/// maps without bound.
+const DEFAULT_ENGINE_CAP: usize = 1024;
 
 /// Shared drop taxonomy for the v2c and v3 notification listeners
 /// (notify/v3.py:90–107).
@@ -168,6 +174,10 @@ impl SaltCache {
 struct ReplayState {
     baselines: HashMap<Vec<u8>, EngineBaseline>,
     salt_caches: HashMap<(Vec<u8>, String), SaltCache>,
+    /// Least-recently-used engine order (back = most recent). An engine is
+    /// pushed back when first adopted and whenever it is touched; at the cap
+    /// the front engine is evicted from both maps (§8 bounded engine tracking).
+    engine_order: VecDeque<Vec<u8>>,
 }
 
 /// RFC 3414 §3.2.7 receive-side replay and time-window checks
@@ -178,17 +188,24 @@ struct ReplayState {
 /// username) salt cache. Notifications that fail a check are dropped by the
 /// caller; the returned [`V3ReceiveVerdict`] carries the reason.
 ///
+/// The number of tracked engines is bounded by `engine_cap` (default 1024,
+/// LRU): a new engine evicts the least-recently-used one at the cap, which
+/// reverts to first-seen adoption on its next datagram — identical to a
+/// brand-new engine (§8 bounded engine tracking).
+///
 /// The reference's `clock` callable is the `Clock` seam (§7) — a deterministic
 /// test clock advances replay windows in the unit tests below.
 pub struct V3ReplayGuard {
     state: std::sync::Mutex<ReplayState>,
     time_window: f64,
     salt_cache_size: usize,
+    engine_cap: usize,
     clock: Arc<dyn Clock>,
 }
 
 impl V3ReplayGuard {
-    /// Creates a guard with the reference defaults (150 s window, 64-salt LRU).
+    /// Creates a guard with the reference defaults (150 s window, 64-salt LRU,
+    /// 1024 tracked engines).
     #[must_use]
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self::with_limits(clock, TIME_WINDOW_SECONDS, SALT_CACHE_SIZE)
@@ -197,10 +214,23 @@ impl V3ReplayGuard {
     /// Creates a guard with explicit window and cache limits (test seam).
     #[must_use]
     pub fn with_limits(clock: Arc<dyn Clock>, time_window: f64, salt_cache_size: usize) -> Self {
+        Self::with_engine_limit(clock, time_window, salt_cache_size, DEFAULT_ENGINE_CAP)
+    }
+
+    /// Creates a guard with explicit window, cache, and engine-tracking limits
+    /// (test seam).
+    #[must_use]
+    pub fn with_engine_limit(
+        clock: Arc<dyn Clock>,
+        time_window: f64,
+        salt_cache_size: usize,
+        engine_cap: usize,
+    ) -> Self {
         Self {
             state: std::sync::Mutex::new(ReplayState::default()),
             time_window,
             salt_cache_size,
+            engine_cap,
             clock,
         }
     }
@@ -220,6 +250,7 @@ impl V3ReplayGuard {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.touch_engine(&mut state, engine_id);
         let verdict = self.check_boots_and_time(&mut state, engine_id, engine_boots, engine_time);
         if verdict != V3ReceiveVerdict::Accept {
             return verdict;
@@ -239,6 +270,36 @@ impl V3ReplayGuard {
         V3ReceiveVerdict::Accept
     }
 
+    /// Marks `engine_id` as most-recently-used; a tracked engine is never
+    /// evicted while it keeps sending datagrams.
+    fn touch_engine(&self, state: &mut ReplayState, engine_id: &[u8]) {
+        if let Some(position) = state
+            .engine_order
+            .iter()
+            .position(|cached| cached == engine_id)
+            && let Some(recent) = state.engine_order.remove(position)
+        {
+            state.engine_order.push_back(recent);
+        }
+    }
+
+    /// Adopts a first-seen engine's baseline, recording LRU recency and
+    /// evicting the least-recently-used engine at the cap. The evicted engine
+    /// is removed from both maps, so its next datagram is adopted as
+    /// first-seen (§8 bounded engine tracking).
+    fn adopt_engine(&self, state: &mut ReplayState, engine_id: &[u8], baseline: EngineBaseline) {
+        state.baselines.insert(engine_id.to_vec(), baseline);
+        state.engine_order.push_back(engine_id.to_vec());
+        if state.engine_order.len() > self.engine_cap
+            && let Some(oldest) = state.engine_order.pop_front()
+        {
+            state.baselines.remove(&oldest);
+            state
+                .salt_caches
+                .retain(|(cached_engine_id, _), _| cached_engine_id != &oldest);
+        }
+    }
+
     fn check_boots_and_time(
         &self,
         state: &mut ReplayState,
@@ -247,8 +308,9 @@ impl V3ReplayGuard {
         engine_time: i64,
     ) -> V3ReceiveVerdict {
         let Some(baseline) = state.baselines.get(engine_id) else {
-            state.baselines.insert(
-                engine_id.to_vec(),
+            self.adopt_engine(
+                state,
+                engine_id,
                 EngineBaseline {
                     engine_boots,
                     engine_time,
@@ -273,6 +335,8 @@ impl V3ReplayGuard {
             return V3ReceiveVerdict::Accept;
         }
         // Engine rebooted: accept and rebase the baseline (and the salt cache).
+        // The engine is already tracked — recency was refreshed by
+        // `touch_engine` at the top of `check`, so no LRU push here.
         state.baselines.insert(
             engine_id.to_vec(),
             EngineBaseline {
@@ -318,6 +382,9 @@ mod tests {
     use std::time::Duration;
 
     const ENGINE_ID: &[u8] = b"\x80\x00\x01\x02\x03DDDDDDDDDDDD";
+    const ENGINE_A: &[u8] = b"\x80\x00\x00\x00\x00AAAAAAAA";
+    const ENGINE_B: &[u8] = b"\x80\x00\x00\x00\x00BBBBBBBB";
+    const ENGINE_C: &[u8] = b"\x80\x00\x00\x00\x00CCCCCCCC";
     const USER: &str = "listener";
     const SALT_A: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
     const SALT_B: &[u8] = &[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
@@ -495,6 +562,137 @@ mod tests {
             check(&guard, 5, 100, SALT_B),
             V3ReceiveVerdict::Accept,
             "B was evicted"
+        );
+    }
+
+    #[test]
+    fn engine_tracking_is_bounded_at_cap() {
+        // Inserting cap+1 engines retains exactly the cap: the oldest engine
+        // is evicted and the two most recent keep their baselines.
+        let guard = V3ReplayGuard::with_engine_limit(clock(), 150.0, 2, 2);
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_B, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        // C evicts A (the LRU engine).
+        assert_eq!(
+            guard.check(ENGINE_C, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        // B and C are still tracked: going backwards is a replay.
+        assert_eq!(
+            guard.check(ENGINE_B, 4, 200, USER, b""),
+            V3ReceiveVerdict::EngineBootsReplay
+        );
+        assert_eq!(
+            guard.check(ENGINE_C, 4, 200, USER, b""),
+            V3ReceiveVerdict::EngineBootsReplay
+        );
+        // A was evicted: its next datagram is adopted first-seen — a lower
+        // boots value is accepted, exactly like a brand-new engine.
+        assert_eq!(
+            guard.check(ENGINE_A, 1, 10, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn access_refreshes_engine_recency() {
+        let guard = V3ReplayGuard::with_engine_limit(clock(), 150.0, 2, 2);
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_B, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        // Accessing A refreshes its recency; B is now the LRU engine.
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 101, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        // Inserting C evicts B, not A.
+        assert_eq!(
+            guard.check(ENGINE_C, 5, 100, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        // A is still tracked: going backwards is a replay.
+        assert_eq!(
+            guard.check(ENGINE_A, 4, 200, USER, b""),
+            V3ReceiveVerdict::EngineBootsReplay
+        );
+        // B was evicted and reverts to first-seen adoption.
+        assert_eq!(
+            guard.check(ENGINE_B, 1, 10, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn evicted_engine_reverts_to_first_seen_adoption() {
+        // Cap of one: every new engine evicts the previous one. The evicted
+        // engine's next datagram is adopted as a brand-new baseline — a lower
+        // boots value does NOT trigger the replay check.
+        let guard = V3ReplayGuard::with_engine_limit(clock(), 150.0, 2, 1);
+        assert_eq!(
+            guard.check(ENGINE_A, 9, 900, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_B, 9, 900, USER, b""),
+            V3ReceiveVerdict::Accept,
+            "B evicts A"
+        );
+        assert_eq!(
+            guard.check(ENGINE_A, 1, 10, USER, b""),
+            V3ReceiveVerdict::Accept,
+            "evicted A is adopted first-seen"
+        );
+        // The re-adopted baseline now guards A normally.
+        assert_eq!(
+            guard.check(ENGINE_A, 0, 10, USER, b""),
+            V3ReceiveVerdict::EngineBootsReplay
+        );
+    }
+
+    #[test]
+    fn engine_cap_does_not_affect_verdicts_within_capacity() {
+        // The cap bounds tracked-engine COUNT, not per-engine semantics:
+        // within the cap every check behaves exactly like the default guard
+        // (boots replay, salt dedup, reboot rebase all unchanged).
+        let fake = Arc::new(FakeClock::new());
+        let guard = V3ReplayGuard::with_engine_limit(fake.clone(), 150.0, 2, 2);
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, SALT_A),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_B, 5, 100, USER, SALT_A),
+            V3ReceiveVerdict::Accept
+        );
+        // Duplicate salt is still rejected for a tracked engine.
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, SALT_A),
+            V3ReceiveVerdict::DuplicateSalt
+        );
+        // Boots going backwards is still a replay.
+        assert_eq!(
+            guard.check(ENGINE_A, 4, 200, USER, b""),
+            V3ReceiveVerdict::EngineBootsReplay
+        );
+        // A reboot still rebases the baseline (and the salt cache).
+        assert_eq!(
+            guard.check(ENGINE_B, 6, 200, USER, SALT_A),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_B, 6, 200, USER, SALT_A),
+            V3ReceiveVerdict::DuplicateSalt
         );
     }
 

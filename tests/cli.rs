@@ -30,7 +30,9 @@
 //!   binds its responder/listener (or targets one) on a unique port from a
 //!   fixed base range via an atomic counter, so tests run in parallel without
 //!   colliding while the CLI is always given an explicit numeric port
-//!   ("fixed port" in the plan's sense — no OS-assigned port parsing).
+//!   ("fixed port" in the plan's sense — no OS-assigned port parsing). When
+//!   the base is held by another run of the suite, a pre-flight probe shifts
+//!   the base to an OS-assigned port (conformance pattern).
 //! - **Blocking calls**: subprocess spawns run through
 //!   `tokio::task::spawn_blocking` so the in-process responder/listener tasks
 //!   keep being polled on the executor while the CLI runs.
@@ -44,6 +46,7 @@ use std::io::BufRead;
 use std::net::Ipv4Addr;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -80,9 +83,33 @@ const PORT_BASE: u16 = 21500;
 const PORT_RANGE: u16 = 1000;
 static NET_PORT: AtomicU16 = AtomicU16::new(0);
 
+/// The suite port base, resolved once per process (conformance pre-flight
+/// probe pattern, tests/conformance/snmpd.rs:115–129): the preferred
+/// [`PORT_BASE`] when free, otherwise an OS-assigned base. A second concurrent
+/// run of the suite that already holds 21500+ therefore gets a disjoint base
+/// instead of colliding on the deterministic ports.
+fn suite_port_base() -> u16 {
+    static BASE: OnceLock<u16> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        if std::net::UdpSocket::bind(("127.0.0.1", PORT_BASE)).is_ok() {
+            PORT_BASE
+        } else {
+            eprintln!(
+                "cli: base port {PORT_BASE} is held by another process; \
+                 allocating from an OS-assigned base"
+            );
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("bind ephemeral probe")
+                .local_addr()
+                .expect("probe has an address")
+                .port()
+        }
+    })
+}
+
 /// The next deterministic fixed port for this suite.
 fn fixed_port() -> u16 {
-    PORT_BASE + NET_PORT.fetch_add(1, Ordering::Relaxed) % PORT_RANGE
+    suite_port_base() + NET_PORT.fetch_add(1, Ordering::Relaxed) % PORT_RANGE
 }
 
 /// The built binary under test (set by cargo for integration tests).
