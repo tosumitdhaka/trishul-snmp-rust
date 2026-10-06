@@ -422,16 +422,43 @@ pub(crate) fn run_isolated<T>(handler: impl FnOnce() -> Result<T, Error>) -> Res
     }
 }
 
+/// Like [`run_isolated`], but additionally returns the raw panic payload text
+/// when the handler panicked (`Some`), so the responder can record the message
+/// in its recent-panic drain alongside the counter. `None` when the handler
+/// completed or returned a regular error.
+pub(crate) fn run_isolated_with_panic<T>(
+    handler: impl FnOnce() -> Result<T, Error>,
+) -> (Result<T, Error>, Option<String>) {
+    match catch_unwind(AssertUnwindSafe(handler)) {
+        Ok(value) => (value, None),
+        Err(payload) => {
+            let text = panic_payload_text(payload);
+            (
+                Err(Error::Protocol(ProtocolError::new(format!(
+                    "listener internal panic: {text}"
+                )))),
+                Some(text),
+            )
+        }
+    }
+}
+
+/// The raw panic payload text (the `&str`/`String` a panic carried, otherwise
+/// a generic fallback) — without the `listener internal panic:` prefix.
+fn panic_payload_text(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// Human-readable text for a panic payload (a `&str` or `String` when the
 /// panic carried one, otherwise a generic message).
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        format!("listener internal panic: {message}")
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        format!("listener internal panic: {message}")
-    } else {
-        "listener internal panic".to_string()
-    }
+    format!("listener internal panic: {}", panic_payload_text(payload))
 }
 
 /// The outcome of processing one v1/v2c datagram.

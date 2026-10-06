@@ -10,8 +10,10 @@
 //! on the reply send surfaces out of `serve()` like the reference's re-raise
 //! (server.py:115–122).
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use crate::codec::pdu::{Pdu, PduKind};
 use crate::codec::v3::{MSG_FLAG_REPORTABLE, V3Message, decode_scoped_pdu};
 use crate::error::Error;
 use crate::mib::MibBundle;
-use crate::notify::listener::{community_allowed, peek_message_version, run_isolated};
+use crate::notify::listener::{community_allowed, peek_message_version, run_isolated_with_panic};
 use crate::notify::v3_path::{
     V3DecodedDatagram, V3ResponseContext, decode_v3_auth_priv, encode_discovery_report,
     encode_v3_response, is_discovery_probe,
@@ -55,6 +57,8 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 65535;
 /// msgAuthoritativeEngineTime must be within ±150 s of the local
 /// snmpEngineTime (the listener's replay window, notify/replay.rs:14).
 const TIME_WINDOW_SECONDS: u32 = 150;
+/// Capacity of the recent-panic message drain (oldest dropped).
+const RECENT_PANICS_CAP: usize = 32;
 
 /// Responder configuration (§5.7).
 pub struct ResponderConfig {
@@ -160,6 +164,9 @@ pub struct SnmpResponder {
     /// Handler panics caught and isolated by the serve loop (§8 responder
     /// panic counter; the `responder: …` stderr branch).
     panic_count: AtomicU64,
+    /// The most recent handler-panic payload texts, oldest first, bounded by
+    /// `RECENT_PANICS_CAP` (see [`SnmpResponder::recent_panics`]).
+    recent_panics: Mutex<VecDeque<String>>,
 }
 
 impl SnmpResponder {
@@ -227,6 +234,7 @@ impl SnmpResponder {
             cancel,
             local_addr,
             panic_count: AtomicU64::new(0),
+            recent_panics: Mutex::new(VecDeque::with_capacity(RECENT_PANICS_CAP)),
         })
     }
 
@@ -257,6 +265,22 @@ impl SnmpResponder {
     #[must_use]
     pub fn panic_count(&self) -> u64 {
         self.panic_count.load(Ordering::Relaxed)
+    }
+
+    /// The payload texts of the most recent handler panics, oldest first,
+    /// bounded by `RECENT_PANICS_CAP` (older entries are dropped). Each
+    /// drained message corresponds to one [`SnmpResponder::panic_count`]
+    /// increment — the raw `&str`/`String` the panicking handler panicked
+    /// with (or a generic placeholder for non-string payloads). Intended for
+    /// diagnostics: pairing the count with *what* panicked.
+    #[must_use]
+    pub fn recent_panics(&self) -> Vec<String> {
+        self.recent_panics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Sets an object on the default in-memory source (server.py:157–159).
@@ -296,12 +320,12 @@ impl SnmpResponder {
     /// The reference rejects a negative `count`; `usize` makes that
     /// unrepresentable. Returns the number of handled requests.
     ///
-    /// A panic inside a per-datagram handler is caught and logged to stderr
-    /// (`responder: …`) and counted by [`SnmpResponder::panic_count`], then
-    /// the loop continues — the responder has no event channel to surface
-    /// into by design (`serve` is the only consumer, unlike the listener's
-    /// `recv`); surfacing panics through a typed channel is a post-1.0
-    /// candidate.
+    /// A panic inside a per-datagram handler is caught, logged to stderr
+    /// (`responder: …`), counted by [`SnmpResponder::panic_count`], and drained
+    /// to [`SnmpResponder::recent_panics`], then the loop continues — the
+    /// responder has no event channel to surface into by design (`serve` is
+    /// the only consumer, unlike the listener's `recv`); surfacing panics
+    /// through a typed channel is a post-1.0 candidate.
     pub async fn serve(&self, count: usize) -> Result<usize, Error> {
         let mut handled = 0usize;
         let mut cancel_rx = self.cancel.subscribe();
@@ -314,7 +338,9 @@ impl SnmpResponder {
                 }
                 datagram = self.server.receive() => {
                     let Some(datagram) = datagram else { break; };
-                    match run_isolated(|| Ok(self.handle_datagram(&datagram))) {
+                    let (outcome, panic_text) =
+                        run_isolated_with_panic(|| Ok(self.handle_datagram(&datagram)));
+                    match outcome {
                         Ok(DatagramOutcome::Respond(bytes)) => {
                             self.server
                                 .sendto(&bytes, datagram.source_address)
@@ -329,8 +355,18 @@ impl SnmpResponder {
                             // pattern). There is no event channel to surface
                             // into — the responder's `serve` has no `recv`
                             // counterpart — so the panic is logged, counted,
-                            // and the loop continues.
+                            // drained to `recent_panics`, and the loop
+                            // continues.
                             self.panic_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(text) = panic_text {
+                                let mut recent = self.recent_panics.lock().unwrap_or_else(
+                                    |poisoned| poisoned.into_inner(),
+                                );
+                                if recent.len() >= RECENT_PANICS_CAP {
+                                    recent.pop_front();
+                                }
+                                recent.push_back(text);
+                            }
                             eprintln!("responder: {error}");
                         }
                     }
@@ -825,5 +861,113 @@ mod tests {
             err.to_string().contains("v1_trap"),
             "encode failure surfaced: {err}"
         );
+    }
+
+    /// The panic-count test seam in one place: a responder whose exact-lookup
+    /// source panics for every OID in `100..100+count` with the message
+    /// `injected panic {index}` and answers everything else.
+    struct PanicSeam {
+        responder: Arc<SnmpResponder>,
+    }
+
+    /// A v2c GET request for `oid` (the panic-seam test datagram).
+    fn v2c_get_request(oid: &Oid) -> Vec<u8> {
+        encode_message(&SnmpMessage {
+            version: SnmpVersion::V2c,
+            community: b"public".to_vec(),
+            pdu: Pdu {
+                kind: PduKind::GetRequest,
+                request_id: 1,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(oid.clone(), SnmpValue::Null)],
+                v1_trap: None,
+            },
+        })
+        .expect("request encodes")
+    }
+
+    async fn panic_seam(panic_count: u32) -> PanicSeam {
+        let responder = Arc::new(
+            SnmpResponder::bind(ResponderConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                source: Some(Arc::new(CallbackObjectSource::new(
+                    Arc::new(move |oid: &Oid| {
+                        let last = oid.arcs().last().copied().unwrap_or(0);
+                        if (100..100 + panic_count).contains(&last) {
+                            panic!("injected panic {}", last - 100);
+                        }
+                        Some(SnmpValue::Integer(7))
+                    }),
+                    Arc::new(|_oid: &Oid| None),
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("bind test responder"),
+        );
+        PanicSeam { responder }
+    }
+
+    /// Drives `serve(1)` with `panics` panicking datagrams followed by one
+    /// healthy request (the only way to terminate the count-bounded serve);
+    /// returns the joined responder.
+    async fn serve_after_panics(seam: &PanicSeam, panics: u32) {
+        let serve = {
+            let responder = Arc::clone(&seam.responder);
+            tokio::spawn(async move { responder.serve(1).await })
+        };
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind client socket");
+        for i in 0..panics {
+            let oid = Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 4242, 100 + i]).expect("valid OID");
+            client
+                .send_to(&v2c_get_request(&oid), seam.responder.local_addr())
+                .await
+                .expect("send panicking request");
+        }
+        let safe_oid = Oid::from_arcs(&[1, 3, 6, 1, 4, 1, 4242, 200]).expect("valid OID");
+        client
+            .send_to(&v2c_get_request(&safe_oid), seam.responder.local_addr())
+            .await
+            .expect("send healthy request");
+        let handled = serve.await.expect("serve task").expect("serve ok");
+        assert_eq!(handled, 1, "the healthy request was answered");
+    }
+
+    #[tokio::test]
+    async fn recent_panics_drains_the_panicking_handlers_payload() {
+        // The panic count is paired with *what* panicked: the drained message
+        // is the raw payload the handler panicked with (not the prefixed
+        // stderr line).
+        let seam = panic_seam(1).await;
+        serve_after_panics(&seam, 1).await;
+        assert_eq!(seam.responder.panic_count(), 1);
+        assert_eq!(seam.responder.recent_panics(), vec!["injected panic 0"]);
+    }
+
+    #[tokio::test]
+    async fn recent_panics_caps_at_thirty_two_and_drops_the_oldest() {
+        // 33 distinct panics: the drain keeps the newest 32, the oldest (the
+        // very first) is dropped, and each remaining entry pairs one-for-one
+        // with a panic_count increment.
+        const PANICS: u32 = RECENT_PANICS_CAP as u32 + 1;
+        let seam = panic_seam(PANICS).await;
+        serve_after_panics(&seam, PANICS).await;
+        assert_eq!(seam.responder.panic_count(), u64::from(PANICS));
+        let drained = seam.responder.recent_panics();
+        assert_eq!(drained.len(), RECENT_PANICS_CAP, "bounded drain");
+        assert_eq!(drained[0], "injected panic 1", "the first panic is dropped");
+        assert_eq!(
+            drained[RECENT_PANICS_CAP - 1],
+            format!("injected panic {}", PANICS - 1),
+            "the newest panic is retained"
+        );
+        // Oldest-first ordering: no gaps, no reordering.
+        for (index, message) in drained.iter().enumerate() {
+            assert_eq!(*message, format!("injected panic {}", index + 1));
+        }
     }
 }

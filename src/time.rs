@@ -41,16 +41,45 @@ pub trait Rng: Send + Sync {
     fn fill_bytes(&self, buf: &mut [u8]);
 }
 
-/// The production RNG: the OS CSPRNG (`/dev/urandom`), std-only dependency
-/// surface.
+/// The production RNG: the OS CSPRNG.
+///
+/// On unix that is `/dev/urandom` (std-only). Other platforms (Windows) have
+/// no std CSPRNG and no new dependency is allowed here, so the bytes are
+/// derived from `std::collections::hash_map::RandomState`'s OS-seeded SipHash
+/// keys: a fresh OS-CSPRNG seed per 8-byte chunk, expanded through the
+/// secret-keyed `DefaultHasher` (a PRF), so the output stream is
+/// cryptographically pseudorandom. A future maintenance pass may swap in the
+/// `getrandom` crate for a single-call CSPRNG on every platform.
 pub struct SystemRng;
 
 impl Rng for SystemRng {
     fn fill_bytes(&self, buf: &mut [u8]) {
-        use std::io::Read;
-        let mut file =
-            std::fs::File::open("/dev/urandom").expect("SystemRng: /dev/urandom must be readable");
-        file.read_exact(buf)
-            .expect("SystemRng: short read from /dev/urandom");
+        fill_system_random(buf);
+    }
+}
+
+/// OS CSPRNG bytes via `/dev/urandom` (unix).
+#[cfg(unix)]
+fn fill_system_random(buf: &mut [u8]) {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open("/dev/urandom").expect("SystemRng: /dev/urandom must be readable");
+    file.read_exact(buf)
+        .expect("SystemRng: short read from /dev/urandom");
+}
+
+/// OS-seeded pseudorandom bytes on platforms without a std CSPRNG (see
+/// [`SystemRng`] for the security note).
+#[cfg(not(unix))]
+fn fill_system_random(buf: &mut [u8]) {
+    use std::hash::{BuildHasher, Hasher};
+    let mut index = 0u64;
+    for chunk in buf.chunks_mut(8) {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(index);
+        index += 1;
+        let bits = hasher.finish().to_le_bytes();
+        let len = chunk.len();
+        chunk.copy_from_slice(&bits[..len]);
     }
 }

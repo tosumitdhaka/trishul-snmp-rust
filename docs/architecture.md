@@ -469,6 +469,13 @@ take `&self` (shared source across awaits): counters use interior atomics, uptim
 uses an injected Clock. GETBULK truncation halving loop (`server.py:187–205`) ports
 as-is.
 
+**Panic observability.** The serve loop isolates per-datagram handler panics
+(`catch_unwind`), logs them to stderr (`responder: …`), counts them on
+`SnmpResponder::panic_count`, and drains the raw payload texts of the most recent
+ones through `SnmpResponder::recent_panics` (bounded at 32, oldest dropped) —
+the typed equivalent of the reference's exception-raising `receive()` when no
+event channel exists (`serve` is the only consumer).
+
 ### 5.8 MibBundle
 
 ```rust
@@ -596,7 +603,7 @@ state, which tokio cannot provide.
 | Version checked during structural decode | version checked after full decode (`message.py:62`) | Derive-level ordering; no test depends on it — accepted divergence |
 | Transport errors during the listener receive loop close the listener (`recv()` → `None`) | re-raised out of `__anext__` when not closed (`listener.py:88–94`) | Drop-based teardown has no distinct "not closed" state to re-raise against; the reference's anext-transport tests have no Rust equivalent |
 | Listener panic policy: a panic inside the per-datagram handler is caught (`catch_unwind`, `AssertUnwindSafe`) and surfaced as an `Err` event | exception raises out of `receive()` | The typed equivalent; without it a panic would kill the receive task and read as teardown (`recv() → None`) |
-| `V3ReplayGuard` engine tracking bounded to `engine_cap` (default 1024, LRU) | unbounded per-engine baseline and salt-cache dicts (notify/v3.py:203–204) | Only noAuthNoPriv traffic reaches the guard (auth verification precedes it), so a listener hearing many distinct engine IDs could grow the reference's maps without bound; the Rust guard evicts the least-recently-used engine at the cap — its next datagram reverts to first-seen adoption, identical to a brand-new engine (`src/notify/replay.rs` `adopt_engine`) |
+| `V3ReplayGuard` engine tracking bounded to `engine_cap` (default 1024, LRU) | unbounded per-engine baseline and salt-cache dicts (notify/v3.py:203–204) | Only noAuthNoPriv traffic reaches the guard (auth verification precedes it), so a listener hearing many distinct engine IDs could grow the reference's maps without bound; the Rust guard evicts the least-recently-used engine at the cap — its next datagram reverts to first-seen adoption, identical to a brand-new engine (`src/notify/replay.rs` `adopt_engine`). Recency tracking is amortized O(1): touched engines push a fresh recency entry and leave the superseded one as a lazy tombstone, swept once the dead entries reach the live bound |
 | `UdpServer` queue-overflow drops counted separately (`UdpServer::dropped`) | same single `dropped` counter surface | The listener's 9-reason `DropCounts` taxonomy covers only datagrams the listener actually read; the socket-queue overflow counter predates the listener and stays independent (documented on `DropCounts`) |
 | `MibBundle::display_symbolic` returns `Result<String, Error>` | raises `UnknownOidError` | The §5.8 sketch's `Option<String>` cannot carry the reason; the raising form is kept and callers use `.ok()` where an option suffices |
 | `MibBundle::lookup` returns `Result<OidMatch, Error>` carrying `TranslationError::UnknownOid` | raises `UnknownOidError` | No standalone `UnknownOid` type in the §6 taxonomy; the error rides the top-level `Error` like the sibling facade methods |

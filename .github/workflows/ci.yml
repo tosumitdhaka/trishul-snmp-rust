@@ -26,11 +26,20 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test (stable)
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # fmt/clippy/docs/msrv run on ubuntu only (single-platform jobs above);
+      # the conformance suite (tests/conformance/) is env-gated on
+      # TSNMP_SNMPD and self-skips on macOS/Windows, where snmpd is not
+      # installed — so the plain `cargo test` matrix covers the portable
+      # surface on all three OSes.
       - run: cargo test
 
   msrv:

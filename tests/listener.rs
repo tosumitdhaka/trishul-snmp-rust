@@ -9,7 +9,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::notify::{FrozenClock, make_local_engine, make_raw_notification, make_v3_user};
+use common::notify::{
+    FrozenClock, make_local_engine, make_passphrase_user, make_raw_notification, make_v3_user,
+};
 use tokio::net::UdpSocket;
 
 use trishul_snmp::codec::message::{SnmpMessage, SnmpVersion, encode_message};
@@ -607,6 +609,145 @@ async fn v3_listener_acknowledges_authpriv_informs() {
     );
     assert_eq!(response.error_status, ErrorStatus::NoError);
     assert_eq!(response.request_id, event.request_id);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn v3_notifier_authpriv_inform_send_full_path_roundtrip() {
+    // Phase-4 parity gap: the reference has no authPriv trap/inform SEND test.
+    // Full path, both sides our code — the Notifier encodes, AES-128-CFB
+    // encrypts, and MD5-auths the INFORM; the listener verifies, decrypts, and
+    // auto-acks; `send_inform` returns the decoded ack. Passphrase keys run
+    // the RFC 3414 KDF on both ends, and the injected clock/Rng seams (frozen
+    // clock + fixture RNG) keep the exchange deterministic.
+    let user = make_passphrase_user();
+    let listener_engine = make_local_engine(0x44, 13, 456);
+    let listener = V3NotificationListener::bind(
+        config(FrozenClock::new(1000)),
+        user.clone(),
+        listener_engine.clone(),
+    )
+    .await
+    .unwrap();
+    let port = listener.local_addr().port();
+
+    let notifier = trishul_snmp::notify::sender::Notifier::connect_v3(v3_config(
+        port,
+        user,
+        None,
+        FrozenClock::new(1000),
+    ))
+    .await
+    .unwrap();
+    let extras = vec![
+        (
+            varbind_target(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 7]),
+            SnmpValue::Integer(7),
+        ),
+        (
+            varbind_target(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1]),
+            SnmpValue::OctetString(b"eth0".to_vec()),
+        ),
+    ];
+    let inform_task = tokio::spawn(async move {
+        notifier
+            .send_inform("1.3.6.1.6.3.1.1.5.3", &extras, 55)
+            .await
+            .unwrap()
+    });
+
+    let event = recv_v3_event(&listener).await;
+    let response = inform_task.await.unwrap();
+
+    assert!(event.is_inform());
+    assert_eq!(event.security_level.as_deref(), Some("authPriv"));
+    assert_eq!(event.uptime, Some(55));
+    assert_eq!(
+        event.notification_oid.as_ref(),
+        Some(&oid(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 3]))
+    );
+    // The decoded notification carries the sent varbinds (sysUpTime.0 and
+    // snmpTrapOID.0 are auto-added by the sender, then the two extras).
+    let extras_received: Vec<&VarBind> = event
+        .varbinds
+        .iter()
+        .filter(|vb| vb.oid != oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]))
+        .filter(|vb| vb.oid != oid(&[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0]))
+        .collect();
+    assert_eq!(extras_received.len(), 2);
+    assert_eq!(
+        extras_received[0].oid,
+        oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 7])
+    );
+    assert_eq!(extras_received[0].value, SnmpValue::Integer(7));
+    assert_eq!(
+        extras_received[1].oid,
+        oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1])
+    );
+    assert_eq!(
+        extras_received[1].value,
+        SnmpValue::OctetString(b"eth0".to_vec())
+    );
+    // The notifier got the listener's ack.
+    assert_eq!(response.error_status, ErrorStatus::NoError);
+    assert_eq!(response.request_id, event.request_id);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn v3_notifier_authpriv_trap_send_full_path_roundtrip() {
+    // The trap (no-ack) half of the same parity-gap coverage: encode + AES
+    // priv + auth through the Notifier, verify + decrypt through the listener,
+    // matching varbinds on the wire.
+    let user = make_passphrase_user();
+    let notifier_engine = make_local_engine(0x46, 3, 222);
+    let listener = V3NotificationListener::bind(
+        config(FrozenClock::new(1000)),
+        user.clone(),
+        make_local_engine(0x44, 13, 456),
+    )
+    .await
+    .unwrap();
+    let port = listener.local_addr().port();
+
+    let notifier = trishul_snmp::notify::sender::Notifier::connect_v3(v3_config(
+        port,
+        user,
+        Some(notifier_engine),
+        FrozenClock::new(1000),
+    ))
+    .await
+    .unwrap();
+    let extras = vec![(
+        varbind_target(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 7]),
+        SnmpValue::Integer(7),
+    )];
+    let send_task = tokio::spawn(async move {
+        notifier
+            .send_trap("1.3.6.1.6.3.1.1.5.3", &extras, 55)
+            .await
+            .unwrap()
+    });
+
+    let event = recv_v3_event(&listener).await;
+    let request_id = send_task.await.unwrap();
+
+    assert_eq!(event.pdu_type, "snmpv2-trap");
+    assert_eq!(event.security_level.as_deref(), Some("authPriv"));
+    assert_eq!(event.request_id, request_id);
+    assert_eq!(event.uptime, Some(55));
+    let extras_received: Vec<&VarBind> = event
+        .varbinds
+        .iter()
+        .filter(|vb| vb.oid != oid(&[1, 3, 6, 1, 2, 1, 1, 3, 0]))
+        .filter(|vb| vb.oid != oid(&[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0]))
+        .collect();
+    assert_eq!(extras_received.len(), 1);
+    assert_eq!(
+        extras_received[0].oid,
+        oid(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 7])
+    );
+    assert_eq!(extras_received[0].value, SnmpValue::Integer(7));
     drop(listener);
 }
 

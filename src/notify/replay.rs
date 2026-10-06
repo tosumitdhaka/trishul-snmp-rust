@@ -169,15 +169,38 @@ impl SaltCache {
     }
 }
 
+/// One entry in the engine recency order: the engine id plus the generation it
+/// was pushed with. An entry is a live recency record while its generation
+/// matches `ReplayState::engine_generations`; after the engine is touched (or
+/// re-adopted) a newer entry supersedes it and the old one is a dead tombstone,
+/// skipped during eviction and swept by compaction.
+#[derive(Debug)]
+struct EngineOrderEntry {
+    engine_id: Vec<u8>,
+    generation: u64,
+}
+
 /// Per-engine and per-(engine, username) guard state behind the interior mutex.
 #[derive(Default)]
 struct ReplayState {
     baselines: HashMap<Vec<u8>, EngineBaseline>,
     salt_caches: HashMap<(Vec<u8>, String), SaltCache>,
-    /// Least-recently-used engine order (back = most recent). An engine is
-    /// pushed back when first adopted and whenever it is touched; at the cap
-    /// the front engine is evicted from both maps (§8 bounded engine tracking).
-    engine_order: VecDeque<Vec<u8>>,
+    /// Live generation per engine — doubles as the live-engine set, which is
+    /// always bounded by `engine_cap` (§8 bounded engine tracking).
+    engine_generations: HashMap<Vec<u8>, u64>,
+    /// Least-recently-used engine order (back = most recent) with lazy
+    /// tombstones: touching an engine pushes a fresh entry and leaves the old
+    /// one dead instead of splicing the deque (amortized O(1) — the O(cap)
+    /// scan + `VecDeque::remove` of the pre-hardening implementation would run
+    /// under the guard mutex on every datagram). The front-most *live* entry
+    /// is evicted at the cap; dead entries are swept by
+    /// [`V3ReplayGuard::compact_engine_order`] once they exceed the live
+    /// bound.
+    engine_order: VecDeque<EngineOrderEntry>,
+    /// Monotonic generation counter, incremented on every push and never
+    /// reused, so a re-adopted engine can never collide with its old
+    /// tombstones.
+    next_generation: u64,
 }
 
 /// RFC 3414 §3.2.7 receive-side replay and time-window checks
@@ -191,7 +214,21 @@ struct ReplayState {
 /// The number of tracked engines is bounded by `engine_cap` (default 1024,
 /// LRU): a new engine evicts the least-recently-used one at the cap, which
 /// reverts to first-seen adoption on its next datagram — identical to a
-/// brand-new engine (§8 bounded engine tracking).
+/// brand-new engine (§8 bounded engine tracking). Recency tracking is
+/// amortized O(1) per datagram: touched engines push a fresh recency entry and
+/// leave the superseded one as a dead tombstone, swept by compaction once the
+/// dead entries exceed the live bound (see [`V3ReplayGuard::with_engine_limit`]
+/// for the test seam that pins the compaction invariant).
+///
+/// The salt-cache bound is per (engine, username): each tracked engine carries
+/// one `SaltCache` (capacity `salt_cache_size`, default 64) *per username*.
+/// A single-user listener therefore holds at most
+/// `engine_cap × 1 × salt_cache_size` salt tuples; a multi-user listener would
+/// grow one cache per username per engine, so the engine LRU bounds the total
+/// to `engine_cap × users × salt_cache_size`. Only noAuthNoPriv traffic
+/// reaches the guard (auth verification precedes it), so every salt is empty
+/// in practice and the salt path is skipped (`check`) — the per-(engine, user)
+/// bound is defensive.
 ///
 /// The reference's `clock` callable is the `Clock` seam (§7) — a deterministic
 /// test clock advances replay windows in the unit tests below.
@@ -219,6 +256,15 @@ impl V3ReplayGuard {
 
     /// Creates a guard with explicit window, cache, and engine-tracking limits
     /// (test seam).
+    ///
+    /// An `engine_cap` of 0 degenerates to **first-seen-only adoption**: every
+    /// datagram's engine is adopted and immediately evicted, so the replay and
+    /// time-window checks never have a baseline to compare against and every
+    /// datagram is accepted (the duplicate-salt cache is likewise reset on
+    /// every adoption). This is a test-only seam — the public constructors
+    /// [`V3ReplayGuard::new`] and [`V3ReplayGuard::with_limits`] always use the
+    /// default 1024-engine cap, so the degenerate form is unreachable outside
+    /// tests.
     #[must_use]
     pub fn with_engine_limit(
         clock: Arc<dyn Clock>,
@@ -271,15 +317,45 @@ impl V3ReplayGuard {
     }
 
     /// Marks `engine_id` as most-recently-used; a tracked engine is never
-    /// evicted while it keeps sending datagrams.
+    /// evicted while it keeps sending datagrams. O(1): the old recency entry
+    /// is left as a dead tombstone (swept by [`Self::compact_engine_order`]).
     fn touch_engine(&self, state: &mut ReplayState, engine_id: &[u8]) {
-        if let Some(position) = state
-            .engine_order
-            .iter()
-            .position(|cached| cached == engine_id)
-            && let Some(recent) = state.engine_order.remove(position)
+        if state.engine_generations.contains_key(engine_id) {
+            self.push_engine_order(state, engine_id);
+        }
+        self.compact_engine_order(state);
+    }
+
+    /// Pushes a fresh recency entry for a live engine and records its new
+    /// generation (the superseded entry becomes a tombstone).
+    fn push_engine_order(&self, state: &mut ReplayState, engine_id: &[u8]) {
+        let generation = state.next_generation;
+        state.next_generation += 1;
+        state
+            .engine_generations
+            .insert(engine_id.to_vec(), generation);
+        state.engine_order.push_back(EngineOrderEntry {
+            engine_id: engine_id.to_vec(),
+            generation,
+        });
+    }
+
+    /// Sweeps dead tombstones once they exceed the live bound: dead entries
+    /// are `order.len() - live` (live ≤ `engine_cap`), so when dead ≥ cap the
+    /// order is compacted back to exactly the live set. Amortized O(1) — at
+    /// least `cap` pushes happen between compactions, and each sweep costs
+    /// O(len) ≤ O(2·cap).
+    fn compact_engine_order(&self, state: &mut ReplayState) {
+        if self.engine_cap > 0
+            && state
+                .engine_order
+                .len()
+                .saturating_sub(state.engine_generations.len())
+                >= self.engine_cap
         {
-            state.engine_order.push_back(recent);
+            state.engine_order.retain(|entry| {
+                state.engine_generations.get(&entry.engine_id) == Some(&entry.generation)
+            });
         }
     }
 
@@ -289,15 +365,25 @@ impl V3ReplayGuard {
     /// first-seen (§8 bounded engine tracking).
     fn adopt_engine(&self, state: &mut ReplayState, engine_id: &[u8], baseline: EngineBaseline) {
         state.baselines.insert(engine_id.to_vec(), baseline);
-        state.engine_order.push_back(engine_id.to_vec());
-        if state.engine_order.len() > self.engine_cap
-            && let Some(oldest) = state.engine_order.pop_front()
-        {
-            state.baselines.remove(&oldest);
-            state
-                .salt_caches
-                .retain(|(cached_engine_id, _), _| cached_engine_id != &oldest);
+        self.push_engine_order(state, engine_id);
+        // The live set is now at cap + 1: evict the front-most *live* entry,
+        // skipping dead tombstones (the front-most live entry is the LRU
+        // engine). Adopting at most one engine per datagram means exactly one
+        // live eviction restores the cap.
+        while state.engine_generations.len() > self.engine_cap {
+            let Some(oldest) = state.engine_order.pop_front() else {
+                break;
+            };
+            if state.engine_generations.get(&oldest.engine_id) == Some(&oldest.generation) {
+                state.engine_generations.remove(&oldest.engine_id);
+                state.baselines.remove(&oldest.engine_id);
+                state
+                    .salt_caches
+                    .retain(|(cached_engine_id, _), _| cached_engine_id != &oldest.engine_id);
+                break;
+            }
         }
+        self.compact_engine_order(state);
     }
 
     fn check_boots_and_time(
@@ -634,6 +720,59 @@ mod tests {
     }
 
     #[test]
+    fn engine_tracking_compacts_tombstones_within_the_cap_plus_tombstone_bound() {
+        // The amortized-O(1) claim, pinned as a compaction invariant (the task
+        // explicitly does NOT require a time-budget test): a large sequence of
+        // distinct engines plus hot re-touches must never grow the live maps
+        // past the cap, and the recency deque (live entries + lazy tombstones)
+        // must never exceed cap + tombstone bound. Tombstones are swept once
+        // they reach the cap, so every surviving order entry matches its
+        // generation.
+        const CAP: usize = 32;
+        const ENGINES: usize = 4096;
+        let guard = V3ReplayGuard::with_engine_limit(clock(), 150.0, 2, CAP);
+        for i in 0..ENGINES {
+            let mut engine = vec![0x80, 0x00, 0x00, 0x00, 0x00];
+            engine.extend_from_slice(format!("{i:08}").as_bytes());
+            assert_eq!(
+                guard.check(&engine, 5, 100, USER, b""),
+                V3ReceiveVerdict::Accept
+            );
+            // Hot re-touch: revisiting a tracked engine keeps it live and
+            // accumulates tombstones (the pre-hardening O(cap) scan would
+            // dominate this sequence).
+            if i % 64 == 0 {
+                let hot = b"\x80\x00\x00\x00\x00hot      ".to_vec();
+                assert_eq!(
+                    guard.check(&hot, 5, 100, USER, b""),
+                    V3ReceiveVerdict::Accept
+                );
+            }
+        }
+        let state = guard.state.lock().unwrap();
+        assert!(
+            state.baselines.len() <= CAP,
+            "live baselines bounded by the cap: {}",
+            state.baselines.len()
+        );
+        assert!(
+            state.engine_generations.len() <= CAP,
+            "live generation map bounded by the cap: {}",
+            state.engine_generations.len()
+        );
+        let dead = state.engine_order.len() - state.engine_generations.len();
+        assert!(
+            dead <= CAP,
+            "tombstones swept once they reach the cap: {dead}"
+        );
+        assert!(
+            state.engine_order.len() <= state.engine_generations.len() + CAP,
+            "recency deque bounded by live count + tombstone bound (2×cap): {}",
+            state.engine_order.len()
+        );
+    }
+
+    #[test]
     fn evicted_engine_reverts_to_first_seen_adoption() {
         // Cap of one: every new engine evicts the previous one. The evicted
         // engine's next datagram is adopted as a brand-new baseline — a lower
@@ -693,6 +832,38 @@ mod tests {
         assert_eq!(
             guard.check(ENGINE_B, 6, 200, USER, SALT_A),
             V3ReceiveVerdict::DuplicateSalt
+        );
+    }
+
+    #[test]
+    fn engine_cap_zero_degrades_to_first_seen_only_adoption() {
+        // Pins the documented `with_engine_limit(.., 0)` seam (test-only;
+        // unreachable publicly): every datagram's engine is adopted and
+        // immediately evicted, so no baseline or salt state survives — a lower
+        // boots value and a repeated salt are both accepted, exactly like a
+        // brand-new engine every time.
+        let guard = V3ReplayGuard::with_engine_limit(clock(), 150.0, 2, 0);
+        assert_eq!(
+            guard.check(ENGINE_A, 9, 900, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_A, 1, 10, USER, b""),
+            V3ReceiveVerdict::Accept,
+            "no baseline survives cap 0"
+        );
+        assert_eq!(
+            guard.check(ENGINE_A, 0, 10, USER, b""),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, SALT_A),
+            V3ReceiveVerdict::Accept
+        );
+        assert_eq!(
+            guard.check(ENGINE_A, 5, 100, USER, SALT_A),
+            V3ReceiveVerdict::Accept,
+            "no salt-cache state survives cap 0"
         );
     }
 

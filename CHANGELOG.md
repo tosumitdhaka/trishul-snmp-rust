@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (CLI-level, library-level, agent-floor decomposition, codec microbench,
   resource usage) under `benchmarks/`, with the measured results documented in
   `docs/benchmarks.md`.
+- **Amortized-O(1) replay-guard engine LRU**: the v3 notification listener's
+  engine recency tracking now uses lazy tombstones (a touched engine pushes a
+  fresh recency entry; superseded entries are compacted once the dead count
+  reaches the live bound) instead of an O(cap) scan + `VecDeque::remove` under
+  the guard mutex per datagram. Eviction order and first-seen re-adoption
+  semantics are unchanged.
+- **Responder panic observability**: `SnmpResponder::recent_panics()` drains the
+  payload texts of the most recent handler panics (bounded at 32, oldest
+  dropped), pairing the existing `panic_count()` with *what* panicked.
+- **authPriv send coverage**: full-path v3 authPriv INFORM and trap send
+  round-trips (our `Notifier` → our `V3NotificationListener` on loopback:
+  encode + AES-128-CFB encrypt + MD5 auth, verify + decrypt + auto-ack),
+  closing the Phase-4 parity gap for authPriv SEND tests.
+- **Cargo examples**: `examples/get.rs`, `examples/walk.rs`, and
+  `examples/listen.rs` — runnable v2c GET / subtree walk / one-trap listen
+  programs, documented against the repo's `benchmarks/bench-snmpd.conf` agent.
+- **Cross-platform CI**: the test job now runs on ubuntu, macOS, and Windows
+  (formatting/clippy/docs/MSRV stay ubuntu-only). The OS-specific code paths
+  (`SystemRng` entropy source, unix-only `~user` bundle-path expansion and
+  symlink-containment tests) are cfg-gated; the conformance suite remains
+  env-gated and self-skips where `snmpd` is unavailable.
 
 ### Fixed
 

@@ -32,7 +32,10 @@
 //!   colliding while the CLI is always given an explicit numeric port
 //!   ("fixed port" in the plan's sense — no OS-assigned port parsing). When
 //!   the base is held by another run of the suite, a pre-flight probe shifts
-//!   the base to an OS-assigned port (conformance pattern).
+//!   the base to an OS-assigned port (conformance pattern). The probe is a
+//!   bind-check-then-rebind, so two suites starting simultaneously can both
+//!   pass it and briefly share the base — accepted precedent, same as the
+//!   conformance suite (TOCTOU; see `suite_port_base`).
 //! - **Blocking calls**: subprocess spawns run through
 //!   `tokio::task::spawn_blocking` so the in-process responder/listener tasks
 //!   keep being polled on the executor while the CLI runs.
@@ -88,6 +91,13 @@ static NET_PORT: AtomicU16 = AtomicU16::new(0);
 /// [`PORT_BASE`] when free, otherwise an OS-assigned base. A second concurrent
 /// run of the suite that already holds 21500+ therefore gets a disjoint base
 /// instead of colliding on the deterministic ports.
+///
+/// TOCTOU note (accepted precedent, same as conformance): this is a
+/// bind-check-then-rebind probe — the bind here succeeds, the socket is
+/// dropped, and the actual responder/listener binds afterwards. Two suites
+/// starting simultaneously can both pass the probe and briefly share the
+/// base; the collision window is tiny and the deterministic ports are never
+/// left half-allocated.
 fn suite_port_base() -> u16 {
     static BASE: OnceLock<u16> = OnceLock::new();
     *BASE.get_or_init(|| {
